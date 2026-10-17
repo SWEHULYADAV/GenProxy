@@ -1,0 +1,10 @@
+# Optional MCP server — lets AI hosts (OpenCode, Claude Desktop, Cursor, ...)
+# operate this proxy service over the Model Context Protocol.
+#
+# Install:
+#   venv\Scripts\pip install -r requirements-mcp.txt
+#
+# Run (stdio transport):
+#   venv\Scripts\python proxy_mcp.py
+
+mcp

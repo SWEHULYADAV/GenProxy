@@ -1,0 +1,10 @@
+# Tor-manager.py country list — one ISO-2 code per line.
+# Each line = one local Tor instance (ExitNodes {cc} + StrictNodes 1) on its own SOCKS port.
+# Run:  venv\Scripts\python Tor-manager.py            (uses this file)
+#       venv\Scripts\python Tor-manager.py --countries us,de,jp,br,in,nl,fr,gb,ca,se,ch,sg
+# Note: exit relays do not exist in every country — check "Tor-manager.py --status"
+# and the service's /coverage endpoint. Uncomment/try more and remove ones that fail.
+us
+de
+nl
+jp

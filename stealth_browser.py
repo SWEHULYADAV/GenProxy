@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
 stealth_browser.py - Optional browser-level helper for the local proxy service.
-Supports three engines (auto-selects best available):
-  1. CloakBrowser - Chromium with source-level fingerprint patches (preferred)
-  2. Camoufox     - Firefox patched for browser fingerprint resistance
-  3. Playwright   - Chromium with JS stealth injection fallback
+Supports four engines (auto-selects best available):
+  1. nodriver     - real Chrome over CDP with zero automation markers (best
+                    stealth: 28/31 vs 25/31 for camoufox in 2026 tests), but
+                    direct-only — Chrome's CLI has no proxy-auth support
+  2. CloakBrowser - Chromium with source-level fingerprint patches (preferred
+                    when a proxy is required)
+  3. Camoufox     - Firefox patched for browser fingerprint resistance
+  4. Playwright   - Chromium with JS stealth injection fallback
 
-Both engines:
-  - Route through the local proxy tunnel (http://127.0.0.1:1909)
+Auto order: nodriver first when no proxy is requested; with a proxy it is
+skipped (direct-only) and cloakbrowser -> camoufox -> playwright are tried.
+
+All engines:
+  - Route through the local proxy tunnel (http://127.0.0.1:1909) unless direct
   - Rotate IP on every new session automatically
   - Spoof: Canvas, WebGL, Audio, Fonts, Timezone, navigator.*
   - Handle Cloudflare Bot Management, Turnstile, hCaptcha challenges
@@ -31,11 +38,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
 # ---------------------------------------------------------------------------
 #  Engine availability detection
@@ -58,7 +67,76 @@ try:
 except ImportError:
     _PLAYWRIGHT_OK = False
 
+try:
+    import nodriver as uc
+    _NODRIVER_OK = True
+except ImportError:
+    _NODRIVER_OK = False
+
 DEFAULT_PROXY = "http://127.0.0.1:1909"
+
+# ---------------------------------------------------------------------------
+#  Proxy URL handling (tunnel credentials are auto-injected from the local
+#  service env file when the proxy points at the local tunnel without auth).
+# ---------------------------------------------------------------------------
+_TUNNEL_ENV_FILE = Path(__file__).resolve().parent / "proxy-service-config.env"
+
+
+def _load_service_env() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not _TUNNEL_ENV_FILE.exists():
+        return values
+    try:
+        for line in _TUNNEL_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return values
+
+
+def _resolve_proxy_credentials(proxy_url: Optional[str]) -> Optional[str]:
+    """Inject tunnel credentials from proxy-service-config.env when the proxy
+    URL points at the local tunnel without userinfo (else the tunnel answers
+    407 Proxy Authentication Required)."""
+    if not proxy_url:
+        return proxy_url
+    candidate = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return proxy_url
+    if parsed.username or (parsed.hostname or "") not in {"127.0.0.1", "localhost"}:
+        return candidate
+    env = _load_service_env()
+    key = env.get("PROXY_SERVICE_TUNNEL_KEY", "").strip()
+    if not key:
+        return candidate
+    user = env.get("PROXY_SERVICE_TUNNEL_USER", "proxy").strip() or "proxy"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 1909
+    return f"http://{user}:{key}@{host}:{port}"
+
+
+def _proxy_config(proxy_url: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Build a Playwright/Camoufox proxy dict with credentials split out
+    (their proxy config expects server / username / password fields)."""
+    if not proxy_url:
+        return None
+    candidate = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return {"server": proxy_url}
+    server = f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}"
+    config: Dict[str, Any] = {"server": server}
+    if parsed.username:
+        config["username"] = unquote(parsed.username)
+        config["password"] = unquote(parsed.password or "")
+    return config
 
 # ---------------------------------------------------------------------------
 #  Realistic fingerprint data
@@ -428,8 +506,9 @@ def _scrape_cloakbrowser_sync(
         "geoip": bool(proxy_url),
         "screen": vp,
     }
-    if proxy_url:
-        kwargs["proxy"] = {"server": proxy_url}
+    proxy_cfg = _proxy_config(_resolve_proxy_credentials(proxy_url))
+    if proxy_cfg:
+        kwargs["proxy"] = proxy_cfg
 
     browser = None
     try:
@@ -500,7 +579,7 @@ async def _scrape_camoufox(
     screenshot: Optional[str],
 ) -> Dict[str, Any]:
     vp = random.choice(_MOBILE_VIEWPORTS if mobile else _DESKTOP_VIEWPORTS)
-    proxy_cfg = {"server": proxy_url} if proxy_url else None
+    proxy_cfg = _proxy_config(_resolve_proxy_credentials(proxy_url))
     kwargs: Dict[str, Any] = {
         "headless": headless,
         "geoip": True,
@@ -584,7 +663,7 @@ async def _scrape_playwright(
         f"--window-size={vp['width']},{vp['height']}",
     ]
 
-    proxy_cfg = {"server": proxy_url} if proxy_url else None
+    proxy_cfg = _proxy_config(_resolve_proxy_credentials(proxy_url))
 
     try:
         async with async_playwright() as pw:
@@ -636,6 +715,200 @@ async def _scrape_playwright(
 
 
 # ---------------------------------------------------------------------------
+#  nodriver engine — real Chrome over CDP, zero automation markers
+#  (direct-only: Chrome's command line cannot carry proxy credentials)
+# ---------------------------------------------------------------------------
+def _find_chrome_executable() -> Optional[str]:
+    """Locate a Chromium-family browser for nodriver: Chrome, Edge, or the
+    Playwright-bundled Chromium as a last resort (override: CHROME_PATH)."""
+    candidates: List[Path] = []
+    env_override = os.environ.get("CHROME_PATH", "").strip()
+    if env_override:
+        candidates.append(Path(env_override))
+    for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        base = os.environ.get(env_name, "").strip()
+        if not base:
+            continue
+        candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+        candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        pw_root = Path(local) / "ms-playwright"
+        try:
+            for exe in sorted(
+                pw_root.glob("chromium*/chrome-win/chrome.exe"), reverse=True
+            ):
+                return str(exe)
+        except OSError:
+            pass
+    return None
+
+
+async def _nodriver_challenge_wait(page: "uc.Tab", max_wait: float = 20.0) -> bool:
+    """Block until obvious JS challenge title/markers are gone (True if clear)."""
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        try:
+            title = str(await page.evaluate("document.title") or "").lower()
+            if any(m in title for m in _CF_CHALLENGE_TITLES):
+                await asyncio.sleep(1.5)
+                continue
+            html = str(await page.get_content() or "").encode()[:2048]
+            if any(m in html for m in _CF_CHALLENGE_MARKERS):
+                await asyncio.sleep(1.5)
+                continue
+        except Exception:
+            pass
+        return True
+    return False
+
+
+async def _scrape_nodriver(
+    url: str,
+    proxy_url: Optional[str],
+    headless: bool,
+    mobile: bool,
+    timeout: int,
+    wait_extra_ms: int,
+    screenshot: Optional[str],
+) -> Dict[str, Any]:
+    """nodriver = real Chrome over CDP with zero automation markers.
+
+    Direct-only by design: Chrome's CLI has no proxy-auth support, so this
+    engine cannot use the local tunnel (it answers 407 without credentials).
+    Without a proxy it is the highest-stealth engine available (28/31 vs 25/31
+    for camoufox/patchright in 2026 tests — see RESEARCH-2026-10-17.md).
+    """
+    if not _NODRIVER_OK:
+        return {"ok": False, "engine": "nodriver", "url": url, "error": "not installed"}
+    if proxy_url:
+        return {
+            "ok": False,
+            "engine": "nodriver",
+            "url": url,
+            "error": (
+                "nodriver is direct-only (Chrome CLI has no proxy-auth "
+                "support; the tunnel needs credentials). Use --no-proxy or "
+                "engine=cloakbrowser/camoufox/playwright for proxied runs."
+            ),
+        }
+    chrome_path = _find_chrome_executable()
+    if not chrome_path:
+        return {
+            "ok": False,
+            "engine": "nodriver",
+            "url": url,
+            "error": "no Chrome/Edge/Chromium executable found (set CHROME_PATH)",
+        }
+
+    vp = random.choice(_MOBILE_VIEWPORTS if mobile else _DESKTOP_VIEWPORTS)
+    browser_args = [
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-notifications",
+        "--disable-popup-blocking",
+        "--lang=en-US",
+        f"--window-size={vp['width']},{vp['height']}",
+    ]
+    if mobile:
+        browser_args.append(f"--user-agent={_pw_ua(True)}")
+
+    browser = None
+    page = None
+    try:
+        browser = await asyncio.wait_for(
+            uc.start(
+                headless=headless,
+                sandbox=False,
+                browser_executable_path=chrome_path,
+                browser_args=browser_args,
+                lang="en-US",
+            ),
+            timeout=60,
+        )
+        page = await asyncio.wait_for(
+            browser.get(url),
+            timeout=max(20.0, timeout / 1000.0 + 10.0),
+        )
+        # Let the page settle before judging challenge state
+        await asyncio.sleep(min(3.0, max(1.5, timeout / 1000.0 * 0.1)))
+        cleared = await _nodriver_challenge_wait(page, max_wait=min(20.0, timeout / 1000.0))
+        if wait_extra_ms > 0:
+            await asyncio.sleep(wait_extra_ms / 1000.0)
+        if screenshot:
+            try:
+                await page.save_screenshot(screenshot, full_page=True)
+            except Exception:
+                try:
+                    await page.save_screenshot(screenshot)
+                except Exception:
+                    pass
+        try:
+            content = await page.get_content()
+        except Exception:
+            content = str(await page.evaluate("document.documentElement.outerHTML") or "")
+        final_url = url
+        try:
+            final_url = page.target.url or url
+        except Exception:
+            pass
+        title = ""
+        try:
+            title = str(await page.evaluate("document.title") or "")
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "engine": "nodriver",
+            "url": final_url,
+            "status": None,
+            "title": title,
+            "content": content or "",
+            "content_length": len(content or ""),
+            "challenge_cleared": cleared,
+        }
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "engine": "nodriver",
+            "url": url,
+            "error": f"timeout after {timeout}ms",
+        }
+    except Exception as exc:
+        return {"ok": False, "engine": "nodriver", "url": url, "error": str(exc)}
+    finally:
+        if browser is not None:
+            # Explicit awaited teardown. nodriver's stop() only schedules its
+            # connection close as a fire-and-forget task on the current loop;
+            # when the loop closes right after (typical CLI flow) that task is
+            # lost and the websocket listener is left dangling — observed as an
+            # endless "background listener error: cannot call get()
+            # concurrently" flood during interpreter shutdown. Both Browser and
+            # Tab subclass Connection, so close both CDP connections first.
+            for conn in (page, browser):
+                if conn is not None:
+                    try:
+                        await conn.aclose()
+                    except Exception:
+                        pass
+            try:
+                browser.stop()
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(0.05)  # let stop()'s deferred aclose run
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 #  Public API
 # ---------------------------------------------------------------------------
 async def scrape_url(
@@ -652,19 +925,32 @@ async def scrape_url(
     """
     Scrape *url* with full anti-detection.
 
-    engine: "auto" | "cloakbrowser" | "camoufox" | "playwright"
-      auto -> tries cloakbrowser, then camoufox, then playwright.
+    engine: "auto" | "nodriver" | "cloakbrowser" | "camoufox" | "playwright"
+      auto -> nodriver first when no proxy is set (direct-only engine);
+              with a proxy: cloakbrowser, then camoufox, then playwright.
     proxy_url: None disables proxy routing.
     """
     errors: Dict[str, str] = {}
     engine_order: List[str]
     if engine == "auto":
-        engine_order = ["cloakbrowser", "camoufox", "playwright"]
+        # nodriver is the strongest stealth engine but real Chrome's CLI has
+        # no proxy-auth support, so it only leads when no proxy is requested.
+        if proxy_url:
+            engine_order = ["cloakbrowser", "camoufox", "playwright"]
+        else:
+            engine_order = ["nodriver", "cloakbrowser", "camoufox", "playwright"]
     else:
         engine_order = [engine]
 
     for candidate in engine_order:
-        if candidate == "cloakbrowser":
+        if candidate == "nodriver":
+            if not _NODRIVER_OK:
+                errors[candidate] = "not installed"
+                continue
+            result = await _scrape_nodriver(
+                url, proxy_url, headless, mobile, timeout, wait_extra_ms, screenshot
+            )
+        elif candidate == "cloakbrowser":
             if not _CLOAK_OK:
                 errors[candidate] = "not installed"
                 continue
@@ -702,15 +988,26 @@ async def scrape_url(
             return result
         errors[candidate] = str(result.get("error", "failed"))
 
-    return {
-        "ok": False,
-        "error": (
+    attempted = [name for name, err in errors.items() if err != "not installed"]
+    if attempted:
+        failure_message = (
+            "Browser attempts failed — engine is installed, but the site "
+            "blocked the request or the connection timed out (check "
+            "'engine_errors' for details; often the proxy IP quality, not "
+            "the browser)."
+        )
+    else:
+        failure_message = (
             "No browser engine available. Install one:\n"
             "  pip install -r requirements-browser.txt\n"
+            "  pip install nodriver\n"
             "  python -m cloakbrowser install\n"
             "  python -m camoufox fetch\n"
             "  playwright install chromium"
-        ),
+        )
+    return {
+        "ok": False,
+        "error": failure_message,
         "engine_errors": errors,
         "url": url,
     }
@@ -754,26 +1051,54 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="Save HTML content to this file")
     p.add_argument(
         "--engine",
-        choices=["auto", "cloakbrowser", "camoufox", "playwright"],
+        choices=["auto", "nodriver", "cloakbrowser", "camoufox", "playwright"],
         default="auto",
-        help="Browser engine (default: auto = cloakbrowser, camoufox, playwright)",
+        help=(
+            "Browser engine (default: auto = nodriver when direct, "
+            "cloakbrowser/camoufox/playwright when proxied)"
+        ),
     )
     return p
 
 
 def _print_engine_status() -> None:
     print("Engine status:")
+    print(f"  nodriver   : {'[OK] available' if _NODRIVER_OK else '[--] not installed  (pip install nodriver)'}"
+          f"{'  [direct-only: no proxy auth]' if _NODRIVER_OK else ''}")
     print(f"  cloakbrowser: {'[OK] available' if _CLOAK_OK else '[--] not installed  (pip install -r requirements-browser.txt && python -m cloakbrowser install)'}")
     print(f"  camoufox  : {'[OK] available' if _CAMOUFOX_OK  else '[--] not installed  (pip install -r requirements-browser.txt && python -m camoufox fetch)'}")
     print(f"  playwright: {'[OK] available' if _PLAYWRIGHT_OK else '[--] not installed  (pip install -r requirements-browser.txt && playwright install chromium)'}")
 
 
 def _run_async(coro):
-    """Run an async coroutine using the project's event loop factory.
-    Uses SelectorEventLoop on Windows (required for Playwright subprocess support).
+    """Run an async coroutine with browser subprocess support.
+
+    On Windows, Playwright spawns a driver subprocess, and only the
+    ProactorEventLoop supports subprocesses there (the proxy service's
+    SelectorEventLoop works for aiohttp but raises NotImplementedError
+    for browser subprocesses)."""
+    if sys.platform == "win32":
+        loop = asyncio.new_event_loop()  # Proactor loop on Windows
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    return asyncio.run(coro)
+
+
+def _hard_exit(code: int) -> None:
+    """Terminate the CLI immediately, after results are printed.
+
+    nodriver teardown is not fully deterministic (see _scrape_nodriver); if a
+    background task misbehaves during interpreter shutdown the process could
+    hang with the results already printed. os._exit skips that shutdown path.
     """
-    from proxy_core import run_async_entrypoint
-    return run_async_entrypoint(coro)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
 
 
 def main() -> None:
@@ -782,7 +1107,7 @@ def main() -> None:
 
     _print_engine_status()
 
-    if not _CLOAK_OK and not _CAMOUFOX_OK and not _PLAYWRIGHT_OK:
+    if not _NODRIVER_OK and not _CLOAK_OK and not _CAMOUFOX_OK and not _PLAYWRIGHT_OK:
         parser.error("Install at least one browser engine (see above).")
 
     # Self-test mode - no URL given
@@ -810,7 +1135,7 @@ def main() -> None:
             print(f"  {status} [{engine_used}] {r.get('url', '')}  title={r.get('title','')!r}  len={r.get('content_length',0)}")
             if not r["ok"]:
                 print(f"       error: {r.get('error','')}")
-        return
+        _hard_exit(0 if any(r.get("ok") for r in results) else 2)
 
     proxy = None if args.no_proxy else args.proxy
     print(f"\nScraping: {args.url}")
@@ -834,6 +1159,8 @@ def main() -> None:
 
     summary = {k: v for k, v in result.items() if k != "content"}
     print(json.dumps(summary, indent=2))
+
+    _hard_exit(0 if result.get("ok") else 2)
 
 
 if __name__ == "__main__":

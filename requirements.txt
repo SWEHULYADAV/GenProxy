@@ -6,9 +6,11 @@ aiohttp-socks
 python-socks
 requests
 rich
+curl_cffi           # Chrome TLS-fingerprint HTTP client (direct_fetch.py + hard targets)
 
 # Optional browser-helper packages live in requirements-browser.txt (NOT needed for the API service):
 #   venv\Scripts\pip install -r requirements-browser.txt
+#   venv\Scripts\pip install nodriver          # stealth_browser.py — best stealth (direct / own-IP only)
 #   venv\Scripts\python -m cloakbrowser install
 #   venv\Scripts\python -m camoufox fetch
 #   venv\Scripts\playwright install chromium

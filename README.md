@@ -20,6 +20,8 @@ This project gives you a local proxy platform that:
 - verifies them and keeps only active working proxies in rotation
 - removes failed proxies from live rotation immediately
 - retries requests with another active proxy automatically
+- remembers which proxies worked per target domain (per-domain memory)
+- pulls country-targeted lists so `country=XX` selection spans many countries
 - exposes both a REST API and a standard HTTP proxy tunnel
 - can be used from almost any language, framework, app, SDK, plugin, or automation tool
 
@@ -42,12 +44,16 @@ Main local endpoints:
 
 Main files:
 
-- [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator/Proxy-api.py>) - local API service and HTTP proxy tunnel
-- [proxy_core.py](</c:/Users/Admin/Desktop/Proxy Generator/proxy_core.py>) - source collection, validation, scoring, active pool logic
-- [Live-proxies.py](</c:/Users/Admin/Desktop/Proxy Generator/Live-proxies.py>) - live proxy monitor window
-- [Start-Live-Proxies.bat](</c:/Users/Admin/Desktop/Proxy Generator/Start-Live-Proxies.bat>) - one-click launcher
-- [stealth_browser.py](</c:/Users/Admin/Desktop/Proxy Generator/stealth_browser.py>) - optional browser helper
-- [requirements.txt](</c:/Users/Admin/Desktop/Proxy Generator/requirements.txt>) - Python dependencies for the project
+- [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Proxy-api.py>) - local API service and HTTP proxy tunnel
+- [proxy_core.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_core.py>) - source collection, validation, scoring, active pool logic
+- [Live-proxies.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Live-proxies.py>) - live proxy monitor window
+- [Start-Live-Proxies.bat](</c:/Users/Admin/Desktop/Proxy_Generation-main/Start-Live-Proxies.bat>) - one-click launcher
+- [stealth_browser.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/stealth_browser.py>) - optional browser helper
+- [proxy_mcp.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_mcp.py>) - MCP server so AI agents (OpenCode, Claude Desktop, Cursor) can operate the service
+- [requirements.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/requirements.txt>) - Python dependencies for the project
+- [requirements-mcp.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/requirements-mcp.txt>) - optional dependency for proxy_mcp.py
+- [ROADMAP.md](</c:/Users/Admin/Desktop/Proxy_Generation-main/ROADMAP.md>) - roadmap and gap analysis vs premium providers
+- [residential-proxies.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/residential-proxies.txt>) - your own (paid) residential proxies, one per line
 
 ## What This Project Really Is
 
@@ -79,6 +85,9 @@ That means:
 - some proxies die quickly
 - some proxies get blocked by target websites
 - most free proxies are datacenter proxies, not true residential proxies
+
+If you need true residential IPs, you can plug in your own (paid) ones — see
+"Residential & Paid Proxies (Bring Your Own)" below.
 
 So this project can behave like a local proxy provider, but it cannot promise paid-provider reliability.
 What it does promise is that inside the local service:
@@ -159,7 +168,7 @@ Runtime components:
 ### 1. Open the project folder
 
 ```bat
-cd "C:\Users\Admin\Desktop\Proxy Generator"
+cd "C:\Users\Admin\Desktop\Proxy_Generation-main"
 ```
 
 ### 2. Create a virtual environment
@@ -366,7 +375,32 @@ Shows pool distribution by:
 - protocol
 - country
 - anonymity
+- proxy type (residential / datacenter / mobile / tor / unclassified)
 - score
+
+`GET /stats` also returns `residential_count`, `tor_count` and `manual_count`.
+
+### `GET /coverage`
+
+Country coverage report — which ISO-3166 countries your live pool can currently serve:
+
+- `covered_countries` / `target_countries` / `coverage_percent`
+- `by_country` — active proxy count per country
+- `missing` — ISO-2 codes with no active proxy right now
+
+Use it when your scraper needs proxies from many specific countries.
+
+Records from the built-in country-targeted sources (proxyscrape v4 + proxifly
+free-proxy-list, ~185 ISO codes by default, controlled by `--country-sources`)
+are pre-tagged with the list's country, so coverage fills in immediately as
+refresh cycles run; geo enrichment only fills gaps for records from other
+sources.
+
+Example:
+
+```bat
+curl -H "X-API-Key: YOUR_KEY" "http://127.0.0.1:1712/coverage"
+```
 
 ### `GET /proxies`
 
@@ -379,6 +413,7 @@ Common filters:
 - `protocol=socks5`
 - `country=US`
 - `anonymity=elite`
+- `proxy_type=residential`
 - `min_score=0.5`
 - `limit=50`
 
@@ -432,6 +467,10 @@ Example:
 curl -X POST http://127.0.0.1:1712/fetch ^
   -H "Content-Type: application/json" ^
   -d "{\"url\":\"https://httpbin.org/ip\",\"max_attempts\":10,\"min_score\":0.4}"
+
+curl -X POST http://127.0.0.1:1712/fetch ^
+  -H "Content-Type: application/json" ^
+  -d "{\"url\":\"https://example.com\",\"country\":\"DE\",\"proxy_type\":\"residential\"}"
 ```
 
 ### `POST /reload`
@@ -464,6 +503,8 @@ For `/fetch` and `/proxy`, common fields are:
 - `allow_redirects`
 - `session_id`
 - `min_proxy_interval`
+- `country` — only use proxies from this ISO-2 country (e.g. `"DE"`)
+- `proxy_type` — `residential` / `datacenter` / `mobile` / `tor`
 
 Example JSON body:
 
@@ -480,7 +521,9 @@ Example JSON body:
   "min_score": 0.4,
   "allow_redirects": true,
   "session_id": "user-1",
-  "min_proxy_interval": 0
+  "min_proxy_interval": 0,
+  "country": "DE",
+  "proxy_type": "residential"
 }
 ```
 
@@ -560,6 +603,9 @@ These help you inspect:
 - session metadata
 - last refresh summary
 
+Tor-manager writes its own files next to the project: `tor-proxies.txt` (fed to
+the service every cycle) and `tor-data\` (per-country Tor state + logs).
+
 ## How To Use It In Any App
 
 There are two main integration styles.
@@ -610,6 +656,7 @@ Your app calls:
 ## SDK / Plugin / Integration Explanation
 
 There is no separate custom SDK file in this repo right now.
+(An MCP server for AI agents is included separately as `proxy_mcp.py` — see the MCP section below.)
 Instead, this service is intentionally built around universal standards:
 
 - HTTP proxy tunnel
@@ -947,21 +994,177 @@ and set it to:
 http://127.0.0.1:1909
 ```
 
+## MCP Server (AI Agent Control)
+
+`proxy_mcp.py` exposes this service over the Model Context Protocol (stdio), so an AI host
+(OpenCode, Claude Desktop, Cursor, ...) can check the pool, start/stop the service, and fetch
+targets through the rotating proxies.
+
+Install the extra dependency:
+
+```bat
+venv\Scripts\pip install -r requirements-mcp.txt
+```
+
+### OpenCode
+
+The project already includes `opencode.json` with the `proxy-generator` server configured.
+Run OpenCode in this folder and verify the connection:
+
+```bat
+opencode mcp list
+```
+
+### Claude Desktop
+
+```bat
+venv\Scripts\python -m mcp install proxy_mcp.py --name "Proxy Generator"
+```
+
+### Tools exposed
+
+| Tool | What it does |
+|---|---|
+| `proxy_service_status` | is the service up? (health + PID + config summary) |
+| `proxy_service_start` / `proxy_service_stop` | start / stop the local service |
+| `proxy_status` / `proxy_stats` / `proxy_tunnel_status` | pool + tunnel health and analytics |
+| `proxy_coverage` | which countries the pool can serve + missing ISO-2 codes |
+| `proxy_list` / `proxy_next` / `proxy_random` | inspect and pick active proxies |
+| `proxy_fetch` | fetch a public URL through the rotating pool (JSON + body) |
+| `proxy_reload` | force a pool refresh (rate-limited to once per 60 s) |
+
+Keys are read from `proxy-service-config.env` automatically.
+Optional env overrides: `PROXY_MCP_BASE_URL`, `PROXY_MCP_API_KEY`, `PROXY_MCP_TUNNEL_KEY`.
+
+## Residential & Paid Proxies (Bring Your Own)
+
+Free lists are mostly datacenter IPs. To use true residential proxies from a paid
+provider (Webshare, IPRoyal, Bright Data, Oxylabs, Decodo, ...), put them in
+`residential-proxies.txt` in this folder — one entry per line, all formats accepted:
+
+```text
+1.2.3.4:8080
+username:password@1.2.3.4:8080
+http://username:password@1.2.3.4:8080
+socks5://username:password@gate.provider.com:1080
+```
+
+Hostnames are supported here; lines starting with `#` and inline `# comments` are ignored.
+
+How the service treats them:
+
+- always kept in the pool — never auto-pruned, even when temporarily down
+- verified first in every cycle, so they join the live pool fastest
+- tagged `proxy_type=residential` and `manual=true`
+- selectable explicitly with `proxy_type=residential` on `/proxies`, `/next`,
+  `/random`, `/fetch` (and the MCP tools `proxy_list`, `proxy_next`,
+  `proxy_random`, `proxy_fetch`)
+
+Examples:
+
+```bat
+curl -H "X-API-Key: YOUR_KEY" "http://127.0.0.1:1712/proxies?proxy_type=residential&limit=20"
+
+curl -X POST http://127.0.0.1:1712/fetch ^
+  -H "Content-Type: application/json" ^
+  -H "X-API-Key: YOUR_KEY" ^
+  -d "{\"url\": \"https://httpbin.org/ip\", \"proxy_type\": \"residential\"}"
+```
+
+Free proxies also get a type label automatically from ip-api.com classification
+(`hosting=true` → `datacenter`, `mobile=true` → `mobile`, otherwise `residential`),
+so `proxy_type=residential` can also match free IPs that are not hosted in datacenters.
+
+`GET /stats` returns a `by_type` breakdown plus `residential_count` and `manual_count`.
+
+## Tor Proxies (Free Country Targeting)
+
+The project ships with a bundled Tor Expert Bundle under `tor\` and a manager
+script `Tor-manager.py`. It runs one local Tor instance per country
+(`ExitNodes {cc}` + `StrictNodes 1`) on its own SOCKS port and writes the
+endpoints to `tor-proxies.txt`, which the proxy service reads every cycle and
+tags `proxy_type=tor` with the pinned country — no service restart needed.
+
+Start / inspect / stop:
+
+```bat
+venv\Scripts\python Tor-manager.py --status
+venv\Scripts\python Tor-manager.py
+venv\Scripts\python Tor-manager.py --countries us,de,jp,br
+venv\Scripts\python Tor-manager.py --stop
+```
+
+(without `--countries` the list from `tor-countries.txt` is used)
+
+Then use them like any other proxies:
+
+```bat
+curl -H "X-API-Key: YOUR_KEY" "http://127.0.0.1:1712/proxies?proxy_type=tor"
+
+curl -X POST http://127.0.0.1:1712/fetch ^
+  -H "Content-Type: application/json" ^
+  -H "X-API-Key: YOUR_KEY" ^
+  -d "{\"url\": \"https://example.com\", \"country\": \"DE\"}"
+```
+
+Notes:
+
+- Tor exits do not exist in every country (roughly 70-90 countries have exit
+  relays). Treat these as pinned country IPs, not a rotating residential pool.
+- Bootstrapping takes ~1-2 minutes per start; the first requests can be slow.
+- Many sites block Tor exits — use Tor for country reach and BYO residential
+  for quality.
+- `tor-countries.txt` holds the default country list; `tor-data\` holds
+  per-country Tor state and logs (delete it for a full reset).
+
+`GET /coverage` shows exactly which countries are covered or still missing.
+
 ## Optional Browser Stealth Helper
 
 The main project is the proxy service.
-Browser stealth is optional.
+Browser stealth is optional and uses `stealth_browser.py` (engines, best first):
 
-If you need browser-level help, `stealth_browser.py` can try:
+1. nodriver — real Chrome over CDP with zero automation markers (highest
+   stealth score in 2026 tests). **Direct-only**: Chrome's CLI has no
+   proxy-auth support, so it is skipped whenever a proxy is requested.
+2. CloakBrowser
+3. Camoufox
+4. Playwright
 
-1. CloakBrowser
-2. Camoufox
-3. Playwright
+Auto order: without a proxy, nodriver runs first; with a proxy it is skipped
+and CloakBrowser → Camoufox → Playwright are tried.
 
-Run:
+Install at least one engine (nodriver is a single pip install; Playwright is
+the lightest general option):
 
 ```bat
-venv\Scripts\python stealth_browser.py https://httpbin.org/ip --engine auto
+REM highest stealth (direct / own-IP only)
+venv\Scripts\pip install nodriver
+venv\Scripts\python stealth_browser.py https://www.tatacliq.com/ --no-proxy
+
+REM lightest general engine (works with the proxy tunnel)
+venv\Scripts\pip install playwright
+venv\Scripts\python -m playwright install chromium
+venv\Scripts\python stealth_browser.py https://httpbin.org/ip --engine playwright
+```
+
+The browser routes through the local tunnel by default. Tunnel credentials are
+read automatically from `proxy-service-config.env` (`PROXY_SERVICE_TUNNEL_KEY`
+/ `PROXY_SERVICE_TUNNEL_USER`), so authenticated tunnels work without extra
+flags. On Windows the helper uses the Proactor event loop because Playwright
+needs subprocess support.
+
+More examples:
+
+```bat
+REM render a JS-heavy shop page and save it
+venv\Scripts\python stealth_browser.py "https://www.flipkart.com/" --engine playwright --wait 4000 --output page.html --screenshot shot.png
+
+REM mobile profile (better for social homepages)
+venv\Scripts\python stealth_browser.py "https://www.instagram.com/" --engine playwright --mobile --wait 4000
+
+REM pin one specific pool proxy instead of tunnel rotation (from /next?country=US)
+venv\Scripts\python stealth_browser.py "https://example.com/" --proxy "http://IP:PORT" --engine playwright
 ```
 
 Library example:
@@ -971,20 +1174,161 @@ import asyncio
 from stealth_browser import scrape_url
 
 result = asyncio.run(scrape_url("https://httpbin.org/ip"))
-print(result["status"])
-print(result["content_length"])
+print(result["status"], result["content_length"])
 ```
 
 Important boundary:
 
 - proxy tunnel handles proxy rotation and failover
-- browser helper handles browser-level fingerprint surfaces
+- browser helper handles browser-level fingerprint surfaces (JS challenges,
+  Canvas/WebGL/Audio/font spoofing, mobile profiles)
+- TLS certificate validation stays ON in the browser: intercepting (MITM)
+  proxies are rejected loudly instead of silently decrypted
+- browser rendering cannot fix bad proxy IP reputation: Cloudflare/Akamai
+  sites (Etsy, Meesho, ...) still return 403 to datacenter IPs. Pair the
+  browser with your own residential proxies for those targets.
 
-The tunnel itself cannot rewrite Canvas, WebGL, Audio, fonts, or JavaScript APIs inside encrypted HTTPS pages.
+## Direct Fetch (own IP + Chrome TLS fingerprint)
+
+Free datacenter proxies get 403 from Akamai/DataDome/AWS WAF on many Indian
+stores — but the *same* pages usually load from a normal ISP/residential IP
+when the TLS fingerprint looks like real Chrome. `direct_fetch.py` does exactly
+that: **no proxy by default**, `curl_cffi` impersonating Chrome, courteous pacing.
+Use it for low/medium volume at human-ish rates.
+
+Live-verified full pages from an ordinary Indian ISP IP (2026-10-17): Myntra
+(listing too), Nykaa, Flipkart (search too), JioMart, Croma, Reliance Digital,
+Snapdeal, Pinterest, Etsy India, Shopsy (when its edge allows).
+
+```bat
+REM single page -> file
+venv\Scripts\python direct_fetch.py https://www.myntra.com/shoes --output shoes.html
+
+REM batch from a file, paced, with JSON report
+venv\Scripts\python direct_fetch.py --urls-file urls.txt --json report.json --delay 1.5
+
+REM optional: route via your own proxy/residential instead of the local IP
+venv\Scripts\python direct_fetch.py URL --proxy http://user:pass@host:port
+```
+
+Notes:
+- Public https targets only; keep polite pacing (`--delay`) — your IP is the budget.
+- Akamai JS-sensor sites (Meesho, Ajio) and DataDome (Etsy US locale) still need
+  the browser helper or residential; `RESEARCH-2026-10-17.md` has the full map.
+
+## Fetch Routing: pool / direct / unlock
+
+`POST /fetch` (and `GET /proxy`) accept a `route` parameter:
+
+| route | meaning |
+|---|---|
+| `auto` (default) | hosts in `--unlock-hosts` go through the unlock API; everything else uses the proxy pool |
+| `pool` | rotating free/paid proxy pool (as before) |
+| `direct` | this machine's own IP via curl_cffi (Chrome TLS print), rate-limited |
+| `unlock` | external anti-block API (ScraperAPI/ZenRows/Scrape.do style) |
+
+Direct-route safety: `--direct-concurrency 2` + `--direct-min-interval 1.0`
+(max two parallel, one request started per second) so your own IP never looks
+like a bot. `/stats` reports `direct_calls`.
+
+Response fields: `ok`, `status_code`, `route`, `final_url`, `body` (text
+bodies — HTML/JSON — decoded automatically), `body_base64` (binary bodies),
+`headers`, `proxy_*` fields (empty on direct/unlock) and `attempts`.
+
+```bat
+REM own IP + real Chrome TLS: full Myntra page
+curl.exe -X POST http://127.0.0.1:1712/fetch -H "X-API-Key: %KEY%" -H "Content-Type: application/json" -d "{\"url\":\"https://www.myntra.com/shoes\",\"route\":\"direct\"}"
+```
+
+curl_cffi pool backend: with `PROXY_SERVICE_FETCH_CLIENT=curl_cffi` (already the
+default in `proxy-service-config.env`) every pool/tunnel fetch gets a real
+Chrome TLS fingerprint (JA3/JA4) instead of plain aiohttp — hard blocks on
+sniffing edges downgrade to soft challenges. Switch back globally with
+`PROXY_SERVICE_FETCH_CLIENT=aiohttp`, or per request with `"http_client": "aiohttp"`.
+
+Unlock API adapter (`route=unlock`, or automatic for `--unlock-hosts`): any GET
+template with `{key}` and `{url}` placeholders works:
+
+```
+PROXY_SERVICE_UNLOCK_URL_TEMPLATE=http://api.scraperapi.com?api_key={key}&url={url}
+PROXY_SERVICE_UNLOCK_API_KEY=YOUR_KEY
+PROXY_SERVICE_UNLOCK_HOSTS=meesho.com,etsy.com
+```
+
+Free tiers stack to ~6K hard pages/month at $0 (Bright Data Web Unlocker 5K,
+ZenRows 5K, Scrape.do 1K) — see `RESEARCH-2026-10-17.md`.
+
+## Akamai cookie mint → replay (`akamai_warm.py`)
+
+For Akamai sensor sites (Myntra / Nykaa / Ajio / JioMart / Meesho), real Chrome
+(nodriver) visits the page on your own IP, waits until `_abck` shows the `~-1~`
+validated marker, saves all cookies + the exact User-Agent to
+`akamai-cookies.json`, and `replay` re-fetches with curl_cffi (same exit IP,
+same UA, Chrome TLS):
+
+```bat
+venv\Scripts\python akamai_warm.py test https://www.ajio.com/
+venv\Scripts\python akamai_warm.py replay https://www.meesho.com/ --output page.html
+venv\Scripts\python akamai_warm.py list
+```
+
+Honest boundary: `_abck` validation is behavioural and IP-scored; replays can
+still be re-challenged, cookies expire (minutes to ~1 hour) and die on any
+IP/UA change. Re-run `mint` when replays start failing.
+
+**Ajio/Meesho jugaad (round 4):** Ajio's SPA JSON APIs (`/api/search`,
+`/api/p/<code>`) and product HTML (`/p/<code>`) answer curl_cffi directly —
+also through the free pool; Meesho's `POST /api/v1/products/search` returns
+full catalog JSON on the direct route. Ajio **headful** mint passes
+(`~-1~` validated); headless gets Access Denied. Details:
+`IP-ENGINE-INTEGRATION.md` recipe 6, `RESEARCH-2026-10-17.md` §2.5.
+
+## Tunnel country pinning (engine integration)
+
+The forward-proxy tunnel can now pin the exit country through the username —
+one local tunnel, per-route countries:
+
+| Username | Effect |
+|---|---|
+| `proxy` | any country (classic behaviour) |
+| `proxy-sg` / `proxy-country-sg` | force a Singapore exit (`<cc>` = ISO-2) |
+
+```bat
+REM country-pinned tunnel route (password = tunnel key)
+curl -x http://proxy-sg:TUNNEL_KEY@127.0.0.1:1909 https://api.ipify.org?format=json
+```
+
+If the pool has no proxies for that country the tunnel answers
+`502 No Proxies Available For Country SG` — an explicit failure instead of a
+silently wrong-country exit. `residential-proxies.txt` accepts an explicit
+`|CC` tag for provider gateways (`gate.provider.com:8080|SG`) so paid
+country residential feeds straight into the same pinning. Full engine
+integration guide: `IP-ENGINE-INTEGRATION.md`.
+
+## Stability hardening (2026-10-17)
+
+- The pool refresh loop now survives a broken cycle: it logs the traceback and
+  keeps retrying instead of freezing the pool (suspected cause of the
+  documented silent-death incident).
+- `faulthandler` is enabled at startup and stdout/stderr are line-buffered, so
+  hard crashes leave a stack trace even when the service is started without
+  `-u`.
+- Recommended start command: `venv\Scripts\python.exe -u Proxy-api.py`.
+
+## License, provenance & secrets hygiene
+
+- This folder is a local instance of a third-party educational project
+  ("educational/personal use" disclaimer). No LICENSE file was found in the
+  source tree — keep the folder internal, do not commit it into other repos
+  and do not redistribute it (see `IP-ENGINE-INTEGRATION.md`).
+- `.gitignore` now excludes `proxy-service-config.env`, `residential-proxies.txt`,
+  `akamai-cookies.json` and `output/`; a blank-key
+  `proxy-service-config.example.env` and `residential-proxies.example.txt` are
+  provided for reference.
 
 ## CLI Reference
 
-Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator/Proxy-api.py>):
+Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Proxy-api.py>):
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -1002,13 +1346,24 @@ Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator
 | `--update-interval` | `120.0` | source refresh interval |
 | `--verify-interval` | `60.0` | active pool re-check interval |
 | `--auto-save-interval` | `15.0` | minimum JSON save interval |
-| `--max-candidates` | `1000` | max candidates per cycle |
-| `--verify-batch-size` | `120` | active proxy verify batch size |
+| `--max-candidates` | `2000` | max candidates per cycle (env `PROXY_SERVICE_MAX_CANDIDATES`) |
+| `--verify-batch-size` | `250` | active proxy verify batch size (env `PROXY_SERVICE_VERIFY_BATCH_SIZE`) |
 | `--min-success-rate` | `0.35` | minimum acceptable success rate |
 | `--max-failures` | `3` | max consecutive failures |
 | `--stale-after` | `1800` | stale proxy lifetime in seconds |
 | `--max-response-time` | `12.0` | max average proxy response time |
 | `--source-file` | empty | custom extra source list |
+| `--country-sources` | `default` | per-country list sources (`default` / `off` / `us,de,jp,...`) |
+| `--fetch-client` | `auto` | HTTP client for pool fetches (`auto`/`aiohttp`/`curl_cffi`, env `PROXY_SERVICE_FETCH_CLIENT`) |
+| `--curl-workers` | `64` | curl_cffi worker threads (env `PROXY_SERVICE_CURL_WORKERS`) |
+| `--curl-impersonate` | `chrome` | curl_cffi impersonation profile (`chrome`, `firefox`, `safari`, ...) |
+| `--direct-client` | `curl_cffi` | HTTP client for the direct route (own IP) |
+| `--direct-concurrency` | `2` | max parallel own-IP (direct route) fetches |
+| `--direct-min-interval` | `1.0` | minimum seconds between direct-route fetches |
+| `--unlock-url-template` | empty | unlock API GET template with `{key}` + `{url}` |
+| `--unlock-api-key` | empty | unlock API key |
+| `--unlock-timeout` | `60` | unlock API request timeout (seconds) |
+| `--unlock-hosts` | empty | host suffixes auto-routed via unlock when `route=auto` |
 | `--warmup` | off | build pool before accepting traffic |
 | `--proxy-delay` | `0.1` | delay between proxy attempts |
 | `--rotate-ua` | on | rotate HTTP headers and user-agent |
@@ -1023,6 +1378,14 @@ Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator
 | `--tunnel-relay-timeout` | `120.0` | tunnel idle timeout |
 | `--tunnel-api-key` | required when tunnel is enabled | standard proxy auth password |
 | `--tunnel-auth-user` | `proxy` | standard proxy auth username |
+
+Pool tuning (optional, set in `proxy-service-config.env` — both the .bat launcher
+and MCP `proxy_service_start` pass them through):
+
+- `PROXY_SERVICE_MAX_CANDIDATES` (default `2000`) — candidates kept per source cycle
+- `PROXY_SERVICE_VERIFY_BATCH_SIZE` (default `250`) — active proxies re-checked per verify cycle
+- `PROXY_SERVICE_COUNTRY_SOURCES` (default `default`) — `off` or `us,de,jp,...`
+- `PROXY_SERVICE_RESIDENTIAL_FILE` / `PROXY_SERVICE_TOR_FILE` — custom file paths
 
 ## Startup Checklist
 
@@ -1119,7 +1482,7 @@ Examples include:
 - `proxy-list.download`
 - `openproxylist`
 
-The active runtime source list is maintained directly in [proxy_core.py](</c:/Users/Admin/Desktop/Proxy Generator/proxy_core.py:39>) under `DEFAULT_SOURCES`.
+The active runtime source list is maintained directly in [proxy_core.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_core.py:39>) under `DEFAULT_SOURCES`.
 
 ### Note on ownership
 

@@ -1,0 +1,31 @@
+# Residential / paid proxies for Proxy Generator
+# ---------------------------------------------------------------------------
+# Copy this file to residential-proxies.txt and add your own proxies here
+# (one per line). Every format below is accepted:
+#
+#   1.2.3.4:8080
+#   username:password@1.2.3.4:8080
+#   http://username:password@1.2.3.4:8080
+#   socks5://username:password@gate.provider.com:1080
+#   gate.provider.com:8080|SG          <- optional '|CC' pins the exit country
+#   http://user:pass@gate.provider.com:8081|MY
+#
+# Notes:
+#   - Lines starting with # and inline # comments are ignored.
+#   - Hostnames are OK here (e.g. gate.provider.com:33335) even though the
+#     free-list sources only use raw IPs.
+#   - The '|CC' suffix (ISO-2) is strongly recommended for provider gateways:
+#     geo lookup sees the gateway IP, not the rotating exit, so without the
+#     tag the country filter (and tunnel username pinning proxy-<cc>) may not
+#     find your entry. It also feeds /coverage directly.
+#   - These entries are ALWAYS kept in the pool (never auto-pruned),
+#     re-verified every cycle and tagged proxy_type=residential.
+#   - Use them explicitly with ?proxy_type=residential on
+#     /proxies /next /random /fetch, and pin countries through the tunnel
+#     with username proxy-sg / proxy-country-sg (password = tunnel key).
+
+# Examples (replace with your real proxies from a provider like Webshare,
+# IPRoyal, Bright Data, Oxylabs, Decodo, ...):
+# gate.webshare.io:8000|US
+# user-country-sg:pass@gate.smartproxy.com:7000|SG
+# socks5://user:pass@gw.iproyal.com:32325|MY

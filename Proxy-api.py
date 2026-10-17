@@ -4,16 +4,22 @@ from __future__ import annotations
 import asyncio
 import argparse
 import base64
+import faulthandler
 import hmac
 import ipaddress
 import json
 import logging
+import os
 import random
 import socket
+import sys
+import time
+import traceback
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -25,6 +31,18 @@ try:
     _SOCKS_TUNNEL_OK = True
 except ImportError:
     _SOCKS_TUNNEL_OK = False
+
+# JA3/JA4-correct HTTP client: same TLS fingerprint as real Chrome. Used by
+# --fetch-client=curl_cffi (pool route) and the direct route (own IP) — many
+# anti-bot fronts (Akamai/DataDome/AWS WAF) block on IP reputation but also
+# check the TLS fingerprint, so a datacenter IP with a Chrome print downgrades
+# from "hard 403" to "soft challenge", and an ordinary ISP IP often passes.
+try:
+    from curl_cffi import requests as _curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    _curl_requests = None
+    CURL_CFFI_AVAILABLE = False
 
 logger = logging.getLogger("proxy_api")
 
@@ -543,14 +561,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-candidates",
         type=int,
-        default=1000,
-        help="Maximum candidates retained per source cycle",
+        default=os.environ.get("PROXY_SERVICE_MAX_CANDIDATES", "2000"),
+        help=(
+            "Maximum candidates retained per source cycle "
+            "(env PROXY_SERVICE_MAX_CANDIDATES)"
+        ),
     )
     parser.add_argument(
         "--verify-batch-size",
         type=int,
-        default=120,
-        help="How many active proxies to re-check per cycle",
+        default=os.environ.get("PROXY_SERVICE_VERIFY_BATCH_SIZE", "250"),
+        help=(
+            "How many active proxies to re-check per cycle "
+            "(env PROXY_SERVICE_VERIFY_BATCH_SIZE)"
+        ),
     )
     parser.add_argument(
         "--min-success-rate",
@@ -584,6 +608,126 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source-file", help="Optional file with extra source URLs, one per line"
+    )
+    parser.add_argument(
+        "--residential-file",
+        default=os.environ.get(
+            "PROXY_SERVICE_RESIDENTIAL_FILE", "residential-proxies.txt"
+        ),
+        help=(
+            "Optional file with your own proxies (e.g. paid residential), one per "
+            "line: host:port, user:pass@host:port or socks5://user:pass@host:port. "
+            "They are always kept, re-verified every cycle and tagged residential."
+        ),
+    )
+    parser.add_argument(
+        "--platform-probes",
+        default=os.environ.get("PROXY_SERVICE_PLATFORM_PROBES", ""),
+        help=(
+            "Comma-separated platform probes to tag every working proxy with "
+            "(any of: telegram,instagram,whatsapp). Empty = disabled. Tags feed "
+            "/proxies?platform=... , /next?platform=... and /stats by_platform."
+        ),
+    )
+    parser.add_argument(
+        "--tor-file",
+        default=os.environ.get("PROXY_SERVICE_TOR_FILE", "tor-proxies.txt"),
+        help=(
+            "Optional file written by Tor-manager.py with local Tor SOCKS "
+            "endpoints, one per line: socks5://127.0.0.1:9701|US (pipe + ISO-2 "
+            "country pins the exit country). Always kept, re-verified every "
+            "cycle and tagged proxy_type=tor."
+        ),
+    )
+    parser.add_argument(
+        "--country-sources",
+        default=os.environ.get("PROXY_SERVICE_COUNTRY_SOURCES", "default"),
+        help=(
+            "Country-targeted free list sources. 'default' = built-in country "
+            "list, 'off' = disable, or a comma-separated ISO-2 list like "
+            "'us,de,jp'. Records from these lists are pre-tagged with the "
+            "country so per-country selection works immediately."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-client",
+        choices=["auto", "aiohttp", "curl_cffi"],
+        default=os.environ.get("PROXY_SERVICE_FETCH_CLIENT", "auto"),
+        help=(
+            "HTTP client for the proxy-pool route. 'curl_cffi' sends every pool "
+            "request with a real Chrome TLS fingerprint (JA3/JA4) — better "
+            "against Akamai/Cloudflare/DataDome; 'aiohttp' = classic; 'auto' = "
+            "aiohttp for the pool and curl_cffi for the direct route. "
+            "Env PROXY_SERVICE_FETCH_CLIENT"
+        ),
+    )
+    parser.add_argument(
+        "--curl-workers",
+        type=int,
+        default=os.environ.get("PROXY_SERVICE_CURL_WORKERS", "64"),
+        help="Worker threads for curl_cffi requests (env PROXY_SERVICE_CURL_WORKERS)",
+    )
+    parser.add_argument(
+        "--curl-impersonate",
+        default=os.environ.get("PROXY_SERVICE_CURL_IMPERSONATE", "chrome"),
+        help=(
+            "curl_cffi impersonation profile: chrome, chrome131, firefox, "
+            "safari, edge101, ... (env PROXY_SERVICE_CURL_IMPERSONATE)"
+        ),
+    )
+    parser.add_argument(
+        "--direct-client",
+        choices=["curl_cffi", "aiohttp"],
+        default=os.environ.get("PROXY_SERVICE_DIRECT_CLIENT", "curl_cffi"),
+        help=(
+            "HTTP client for the direct route (own IP). curl_cffi (default) "
+            "sends the real Chrome TLS fingerprint — that is what makes "
+            "ordinary ISP IPs pass anti-bot fronts. "
+            "Env PROXY_SERVICE_DIRECT_CLIENT"
+        ),
+    )
+    parser.add_argument(
+        "--direct-concurrency",
+        type=int,
+        default=os.environ.get("PROXY_SERVICE_DIRECT_CONCURRENCY", "2"),
+        help="Max parallel direct-route fetches from this machine's own IP",
+    )
+    parser.add_argument(
+        "--direct-min-interval",
+        type=float,
+        default=os.environ.get("PROXY_SERVICE_DIRECT_MIN_INTERVAL", "1.0"),
+        help="Minimum seconds between direct-route fetches (own-IP pacing)",
+    )
+    parser.add_argument(
+        "--unlock-url-template",
+        default=os.environ.get("PROXY_SERVICE_UNLOCK_URL_TEMPLATE", ""),
+        help=(
+            "External anti-block API GET template with {key} + {url} places, "
+            "e.g. 'http://api.scraperapi.com?api_key={key}&url={url}'. "
+            "Enables route=unlock and --unlock-hosts auto-routing. "
+            "Env PROXY_SERVICE_UNLOCK_URL_TEMPLATE"
+        ),
+    )
+    parser.add_argument(
+        "--unlock-api-key",
+        default=os.environ.get("PROXY_SERVICE_UNLOCK_API_KEY", ""),
+        help="API key for the unlock service (env PROXY_SERVICE_UNLOCK_API_KEY)",
+    )
+    parser.add_argument(
+        "--unlock-timeout",
+        type=float,
+        default=os.environ.get("PROXY_SERVICE_UNLOCK_TIMEOUT", "60"),
+        help="Timeout for unlock-API requests in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--unlock-hosts",
+        default=os.environ.get("PROXY_SERVICE_UNLOCK_HOSTS", ""),
+        help=(
+            "Comma-separated host suffixes that auto-route through the unlock "
+            "API when route=auto, e.g. 'meesho.com,etsy.com'. Empty = never "
+            "auto-route (route=unlock still works per request). "
+            "Env PROXY_SERVICE_UNLOCK_HOSTS"
+        ),
     )
     parser.add_argument(
         "--warmup",
@@ -706,6 +850,10 @@ def build_config(args: argparse.Namespace) -> HarvesterConfig:
         output_file=args.output,
         test_urls=list(args.probe_urls or DEFAULT_TEST_URLS),
         max_stored_records=args.max_candidates * 2,
+        residential_file=args.residential_file,
+        platform_probes=args.platform_probes,
+        tor_file=args.tor_file,
+        country_source_codes=args.country_sources,
     )
 
 
@@ -752,6 +900,28 @@ def build_access_urls(
     if public_base_url:
         urls["public"] = public_base_url.rstrip("/")
     return urls
+
+
+def _url_host(url: str) -> str:
+    """Lower-cased hostname of a URL without a leading 'www.' ('' if invalid)."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _header_get(headers: Dict[str, str], name: str, default: str = "") -> str:
+    """Case-insensitive header lookup (curl_cffi returns lower-cased names)."""
+    if not headers:
+        return default
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return default
 
 
 def sanitize_outbound_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -841,6 +1011,21 @@ class ProxyAPIService:
         self._sticky_max = 10_000
         self._last_proxy_used: str = ""
         self._last_status_write: float = 0.0   # M-6: debounce status file writes
+        # Direct route (own IP) — rate-limited so the machine's IP stays healthy.
+        self._direct_semaphore = asyncio.Semaphore(
+            max(1, int(getattr(args, "direct_concurrency", 2)))
+        )
+        self._direct_next_allowed: float = 0.0
+        self._direct_calls: int = 0
+        # Unlock-API adapter counters (external anti-block service).
+        self._unlock_calls: int = 0
+        self._unlock_success: int = 0
+        self._unlock_hosts = tuple(
+            h.strip().lower()
+            for h in str(getattr(args, "unlock_hosts", "") or "").split(",")
+            if h.strip()
+        )
+        self._curl_executor: Optional[ThreadPoolExecutor] = None
         self._last_reload_at: float = 0.0       # M-7: rate-limit /reload
 
     def _update_sticky(self, session_id: str, proxy: str) -> None:
@@ -862,6 +1047,7 @@ class ProxyAPIService:
     def _record_runtime_failure(self, record, error: str, probe_url: str) -> None:
         if not self.harvester:
             return
+        record.note_domain_result(_url_host(probe_url), False)
         record.record_failure(
             error=error,
             probe_url=probe_url,
@@ -876,6 +1062,12 @@ class ProxyAPIService:
         if now - self._last_status_write >= 2.0:
             self._write_status_file()
             self._last_status_write = now
+
+    def _record_runtime_success(self, record, target_url: str) -> None:
+        """Remember that this proxy delivered a real response for the host."""
+        host = _url_host(target_url)
+        if host:
+            record.note_domain_result(host, True)
 
     def on_progress(self, payload: Dict[str, Any]) -> None:
         self.progress.update(payload)
@@ -904,6 +1096,10 @@ class ProxyAPIService:
         self.request_session = aiohttp.ClientSession(
             connector=connector, timeout=timeout, trust_env=False
         )
+        self._curl_executor = ThreadPoolExecutor(
+            max_workers=max(4, int(getattr(self.args, "curl_workers", 64))),
+            thread_name_prefix="curl-fetch",
+        )
         self._write_status_file()
 
         if self.args.warmup:
@@ -926,6 +1122,10 @@ class ProxyAPIService:
             await self.request_session.close()
             self.request_session = None
 
+        if self._curl_executor is not None:
+            self._curl_executor.shutdown(wait=False, cancel_futures=True)
+            self._curl_executor = None
+
         if self.harvester:
             await self.harvester.__aexit__(None, None, None)
             self.harvester = None
@@ -934,11 +1134,23 @@ class ProxyAPIService:
         first_cycle = not self.args.warmup
         try:
             while True:
-                await self.refresh_once(
-                    force_collect=first_cycle, force_verify=first_cycle
-                )
-                self.ready_event.set()
-                first_cycle = False
+                try:
+                    await self.refresh_once(
+                        force_collect=first_cycle, force_verify=first_cycle
+                    )
+                    self.ready_event.set()
+                    first_cycle = False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A single broken cycle must never kill the refresh loop —
+                    # otherwise the pool silently freezes (a suspected cause of
+                    # the 2026-10-17 silent-death incident, see RESEARCH §2.4).
+                    print(
+                        "refresh cycle failed (retrying after delay):\n"
+                        + traceback.format_exc(),
+                        flush=True,
+                    )
                 await asyncio.sleep(self.args.refresh_delay)
         except asyncio.CancelledError:
             raise
@@ -964,6 +1176,8 @@ class ProxyAPIService:
         protocol: Optional[str] = None,
         country: Optional[str] = None,
         anonymity: Optional[str] = None,
+        proxy_type: Optional[str] = None,
+        platform: Optional[str] = None,
     ):
         if not self.harvester:
             return []
@@ -971,6 +1185,8 @@ class ProxyAPIService:
             protocol=protocol,
             country=country,
             anonymity=anonymity,
+            proxy_type=proxy_type,
+            platform=platform,
             min_score=min_score,
             limit=limit,
         )
@@ -1000,6 +1216,24 @@ class ProxyAPIService:
             if self.harvester
             else 0,
             "known_records": len(self.harvester.records) if self.harvester else 0,
+            "residential_active": (
+                sum(
+                    1
+                    for record in self.harvester.ranked_active_records()
+                    if record.proxy_type == "residential"
+                )
+                if self.harvester
+                else 0
+            ),
+            "tor_active": (
+                sum(
+                    1
+                    for record in self.harvester.ranked_active_records()
+                    if record.proxy_type == "tor"
+                )
+                if self.harvester
+                else 0
+            ),
             "best_proxy": best_proxy,
             "access_urls": self.access_urls,
             "progress": self.progress,
@@ -1019,6 +1253,407 @@ class ProxyAPIService:
         {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
     )
 
+    async def _aiohttp_request(
+        self,
+        *,
+        proxy_url: Optional[str],
+        method: str,
+        target_url: str,
+        headers: Dict[str, str],
+        body: Optional[bytes],
+        timeout_config: aiohttp.ClientTimeout,
+        allow_redirects: bool,
+        max_response_bytes: int,
+    ):
+        """One target request with aiohttp (proxied, or direct when proxy_url=None).
+
+        Shared by the pool route and the direct route so response processing
+        stays identical. Returns (status, reason, final_url, headers, bytes).
+        """
+        session = self.request_session
+        close_session = False
+        request_kwargs = {
+            "method": method.upper(),
+            "url": target_url,
+            "headers": headers,
+            "data": body,
+            "timeout": timeout_config,
+            "allow_redirects": allow_redirects,
+        }
+        try:
+            if proxy_url is None:
+                pass  # direct: shared session, no proxy
+            elif proxy_url.startswith("socks"):
+                connector = create_proxy_connector(proxy_url, max_concurrent=1)
+                session = aiohttp.ClientSession(
+                    connector=connector, timeout=timeout_config, trust_env=False
+                )
+                close_session = True
+            else:
+                request_kwargs["proxy"] = proxy_url
+
+            assert session is not None
+            async with session.request(**request_kwargs) as response:
+                payload = await response.content.read(max_response_bytes + 1)
+                return (
+                    response.status,
+                    response.reason,
+                    str(response.url),
+                    dict(response.headers),
+                    payload,
+                )
+        finally:
+            if close_session and session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
+    async def _curl_request(
+        self,
+        *,
+        target_url: str,
+        method: str,
+        headers: Dict[str, str],
+        body: Optional[bytes],
+        proxy_url: Optional[str],
+        timeout: float,
+        allow_redirects: bool,
+        max_response_bytes: int,
+    ):
+        """One JA3-correct request (real Chrome TLS fingerprint) via curl_cffi.
+
+        The blocking curl call runs in a worker thread. Returns the same tuple
+        shape as _aiohttp_request: (status, reason, final_url, headers, bytes).
+        """
+        if not CURL_CFFI_AVAILABLE:
+            raise RuntimeError(
+                "curl_cffi is not installed — run: venv\\Scripts\\pip install curl_cffi"
+            )
+        impersonate = str(getattr(self.args, "curl_impersonate", "chrome") or "chrome")
+
+        def _sync():
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            response = _curl_requests.request(
+                method.upper(),
+                target_url,
+                headers=headers or None,
+                data=body,
+                proxies=proxies,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+                impersonate=impersonate,
+            )
+            content = response.content
+            if len(content) > max_response_bytes + 1:
+                content = content[: max_response_bytes + 1]
+            return (
+                response.status_code,
+                getattr(response, "reason", "") or "",
+                str(response.url),
+                dict(response.headers),
+                content,
+            )
+
+        loop = asyncio.get_running_loop()
+        if self._curl_executor is not None:
+            return await loop.run_in_executor(self._curl_executor, _sync)
+        return await asyncio.to_thread(_sync)
+
+    async def _fetch_direct(
+        self,
+        *,
+        target_url: str,
+        method: str,
+        headers: Optional[Dict[str, str]],
+        body: Optional[bytes],
+        timeout: Optional[float],
+        expected: set,
+        allow_redirects: bool,
+        max_response_bytes: int,
+        detect_block_pages: bool,
+        http_client: str,
+    ) -> Dict[str, Any]:
+        """Fetch from this machine's own IP (no proxy), rate-limited.
+
+        Defaults to curl_cffi because the Chrome TLS fingerprint is what makes
+        ordinary ISP IPs pass Akamai/DataDome/AWS WAF fronts (see
+        RESEARCH-2026-10-17.md). Pacing knobs: --direct-concurrency and
+        --direct-min-interval.
+        """
+        client = http_client if http_client in ("aiohttp", "curl_cffi") else str(
+            getattr(self.args, "direct_client", "curl_cffi")
+        ).lower()
+        if client not in ("aiohttp", "curl_cffi"):
+            client = "curl_cffi"
+
+        async with self._direct_semaphore:
+            wait = self._direct_next_allowed - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._direct_next_allowed = time.monotonic() + max(
+                0.0, float(getattr(self.args, "direct_min_interval", 1.0))
+            )
+            self._direct_calls += 1
+
+            headers_for_request = sanitize_outbound_headers(headers or {})
+            if getattr(self.args, "rotate_ua", True) and client == "aiohttp":
+                for hdr_key, hdr_val in get_random_browser_headers().items():
+                    if hdr_key not in headers_for_request:
+                        headers_for_request[hdr_key] = hdr_val
+
+            attempt: Dict[str, Any] = {
+                "attempt": 1,
+                "proxy": "direct",
+                "route": "direct",
+            }
+            try:
+                if client == "curl_cffi":
+                    (
+                        status_code,
+                        reason_text,
+                        final_url_text,
+                        resp_headers,
+                        payload_bytes,
+                    ) = await self._curl_request(
+                        target_url=target_url,
+                        method=method,
+                        headers=headers_for_request,
+                        body=body,
+                        proxy_url=None,
+                        timeout=timeout or self.args.request_timeout,
+                        allow_redirects=allow_redirects,
+                        max_response_bytes=max_response_bytes,
+                    )
+                else:
+                    (
+                        status_code,
+                        reason_text,
+                        final_url_text,
+                        resp_headers,
+                        payload_bytes,
+                    ) = await self._aiohttp_request(
+                        proxy_url=None,
+                        method=method,
+                        target_url=target_url,
+                        headers=headers_for_request,
+                        body=body,
+                        timeout_config=aiohttp.ClientTimeout(
+                            total=timeout or self.args.request_timeout
+                        ),
+                        allow_redirects=allow_redirects,
+                        max_response_bytes=max_response_bytes,
+                    )
+            except Exception as exc:
+                attempt["error"] = exc.__class__.__name__
+                return {
+                    "ok": False,
+                    "route": "direct",
+                    "http_client": client,
+                    "error": attempt["error"],
+                    "attempts": [attempt],
+                }
+
+            truncated = len(payload_bytes) > max_response_bytes
+            payload_bytes = payload_bytes[:max_response_bytes]
+            attempt["status_code"] = status_code
+            attempt["final_url"] = final_url_text
+
+            if detect_block_pages and _is_blocked_response(
+                status_code, payload_bytes[:512]
+            ):
+                attempt["error"] = f"blocked: status={status_code}"
+                return {
+                    "ok": False,
+                    "route": "direct",
+                    "http_client": client,
+                    "error": attempt["error"],
+                    "attempts": [attempt],
+                }
+            if expected and status_code not in expected:
+                attempt["error"] = f"expected {sorted(expected)}, got {status_code}"
+                return {
+                    "ok": False,
+                    "route": "direct",
+                    "http_client": client,
+                    "error": attempt["error"],
+                    "attempts": [attempt],
+                }
+
+            content_type = _header_get(resp_headers, "Content-Type").lower()
+            is_text_response = any(
+                content_type.startswith(prefix)
+                for prefix in (
+                    "text/", "application/json", "application/xml",
+                    "application/javascript", "application/x-www-form-urlencoded",
+                )
+            )
+            return {
+                "ok": True,
+                "route": "direct",
+                "http_client": client,
+                "proxy": "direct",
+                "proxy_url": "",
+                "proxy_score": 1.0,
+                "proxy_country": "",
+                "proxy_anonymity": "own-ip",
+                "proxy_protocol": "direct",
+                "proxy_type": "direct",
+                "attempts": [attempt],
+                "status_code": status_code,
+                "reason": reason_text,
+                "final_url": final_url_text,
+                "headers": resp_headers,
+                "body_bytes": payload_bytes,
+                "body_text": payload_bytes.decode("utf-8", errors="replace")
+                if is_text_response
+                else None,
+                "body_base64": base64.b64encode(payload_bytes).decode("ascii")
+                if not is_text_response
+                else None,
+                "body_encoding": "text" if is_text_response else "base64",
+                "truncated": truncated,
+                "max_response_bytes": max_response_bytes,
+            }
+
+    def _unlock_configured(self) -> bool:
+        return bool(
+            str(getattr(self.args, "unlock_url_template", "") or "").strip()
+            and str(getattr(self.args, "unlock_api_key", "") or "").strip()
+        )
+
+    async def _fetch_via_unlock(
+        self,
+        *,
+        target_url: str,
+        method: str,
+        timeout: Optional[float],
+        expected: set,
+        max_response_bytes: int,
+        detect_block_pages: bool,
+    ) -> Dict[str, Any]:
+        """Fetch through an external anti-block service.
+
+        Works with ScraperAPI / ZenRows / Scrape.do / KDB-style GET templates
+        that take the target as a query parameter, e.g.:
+
+          ScraperAPI : http://api.scraperapi.com?api_key={key}&url={url}
+          ZenRows    : https://api.zenrows.com/v1/?apikey={key}&url={url}&js_render=true
+          Scrape.do  : http://api.scrape.do?token={key}&url={url}
+
+        {key} and {url} are URL-encoded placeholders. The vendor performs the
+        anti-bot bypass (residential IPs + browser rendering) and returns the
+        target's body/status. Note: GET-target only — POST bodies are not
+        forwarded through this route.
+        """
+        if not self._unlock_configured():
+            return {
+                "ok": False,
+                "route": "unlock",
+                "error": (
+                    "unlock API not configured — set --unlock-url-template and "
+                    "--unlock-api-key, e.g. "
+                    "http://api.scraperapi.com?api_key={key}&url={url}"
+                ),
+                "attempts": [],
+            }
+
+        from urllib.parse import quote as _quote
+
+        template = str(self.args.unlock_url_template)
+        api_url = template.replace(
+            "{key}", _quote(str(self.args.unlock_api_key), safe="")
+        ).replace("{url}", _quote(target_url, safe=""))
+
+        unlock_timeout = float(getattr(self.args, "unlock_timeout", 60.0) or 60.0)
+        total_timeout = float(timeout) if timeout else unlock_timeout
+        self._unlock_calls += 1
+        attempt: Dict[str, Any] = {
+            "attempt": 1,
+            "proxy": "unlock-api",
+            "route": "unlock",
+            "status_code": None,
+        }
+        try:
+            assert self.request_session is not None
+            async with self.request_session.request(
+                "GET",
+                api_url,
+                timeout=aiohttp.ClientTimeout(total=total_timeout),
+            ) as response:
+                payload_bytes = await response.content.read(max_response_bytes + 1)
+                status_code = response.status
+                reason_text = response.reason
+                resp_headers = dict(response.headers)
+        except Exception as exc:
+            attempt["error"] = exc.__class__.__name__
+            return {
+                "ok": False,
+                "route": "unlock",
+                "error": attempt["error"],
+                "attempts": [attempt],
+            }
+
+        truncated = len(payload_bytes) > max_response_bytes
+        payload_bytes = payload_bytes[:max_response_bytes]
+        attempt["status_code"] = status_code
+        attempt["final_url"] = target_url
+
+        if detect_block_pages and _is_blocked_response(
+            status_code, payload_bytes[:512]
+        ):
+            attempt["error"] = f"blocked: status={status_code}"
+            return {
+                "ok": False,
+                "route": "unlock",
+                "error": attempt["error"],
+                "attempts": [attempt],
+            }
+        if expected and status_code not in expected:
+            attempt["error"] = f"expected {sorted(expected)}, got {status_code}"
+            return {
+                "ok": False,
+                "route": "unlock",
+                "error": attempt["error"],
+                "attempts": [attempt],
+            }
+
+        self._unlock_success += 1
+        content_type = _header_get(resp_headers, "Content-Type").lower()
+        is_text_response = any(
+            content_type.startswith(prefix)
+            for prefix in (
+                "text/", "application/json", "application/xml",
+                "application/javascript", "application/x-www-form-urlencoded",
+            )
+        )
+        return {
+            "ok": True,
+            "route": "unlock",
+            "proxy": "unlock-api",
+            "proxy_url": "",
+            "proxy_score": 1.0,
+            "proxy_country": "",
+            "proxy_anonymity": "unlock-api",
+            "proxy_protocol": "http",
+            "proxy_type": "unlock",
+            "attempts": [attempt],
+            "status_code": status_code,
+            "reason": reason_text,
+            "final_url": target_url,
+            "headers": resp_headers,
+            "body_bytes": payload_bytes,
+            "body_text": payload_bytes.decode("utf-8", errors="replace")
+            if is_text_response
+            else None,
+            "body_base64": base64.b64encode(payload_bytes).decode("ascii")
+            if not is_text_response
+            else None,
+            "body_encoding": "text" if is_text_response else "base64",
+            "truncated": truncated,
+            "max_response_bytes": max_response_bytes,
+        }
+
     async def fetch_via_proxies(
         self,
         *,
@@ -1032,11 +1667,15 @@ class ProxyAPIService:
         expected_statuses: Optional[List[int]] = None,
         pool_limit: int = 50,
         min_score: float = 0.0,
+        country: Optional[str] = None,
+        proxy_type: Optional[str] = None,
         allow_redirects: bool = True,
         session_id: Optional[str] = None,
         min_proxy_interval: float = 0.0,
         max_response_bytes: int = 10 * 1024 * 1024,
         detect_block_pages: bool = True,
+        route: str = "auto",
+        http_client: str = "auto",
     ) -> Dict[str, Any]:
         if not self.harvester or not self.request_session:
             raise RuntimeError("service not started")
@@ -1058,11 +1697,60 @@ class ProxyAPIService:
         if expected_status is not None:
             _expected.add(int(expected_status))
 
+        # --- Route resolution --------------------------------------------------
+        # auto   -> hosts listed in --unlock-hosts go through the unlock API;
+        #           everything else uses the proxy pool
+        # direct -> this machine's own IP (rate-limited, JA3-correct client)
+        # unlock -> external anti-block service for this request
+        route = (route or "auto").strip().lower()
+        resolved_route = route
+        if route == "auto":
+            host = _url_host(target_url)
+            if self._unlock_configured() and host and any(
+                host == suffix or host.endswith("." + suffix)
+                for suffix in self._unlock_hosts
+            ):
+                resolved_route = "unlock"
+            else:
+                resolved_route = "pool"
+        if resolved_route == "direct":
+            return await self._fetch_direct(
+                target_url=target_url,
+                method=method,
+                headers=headers,
+                body=body,
+                timeout=timeout,
+                expected=_expected,
+                allow_redirects=allow_redirects,
+                max_response_bytes=max_response_bytes,
+                detect_block_pages=detect_block_pages,
+                http_client=http_client,
+            )
+        if resolved_route == "unlock":
+            return await self._fetch_via_unlock(
+                target_url=target_url,
+                method=method,
+                timeout=timeout,
+                expected=_expected,
+                max_response_bytes=max_response_bytes,
+                detect_block_pages=detect_block_pages,
+            )
+
         await self.ensure_ready()
-        records = self.ranked_records(limit=pool_limit, min_score=min_score)
+        records = self.ranked_records(
+            limit=pool_limit,
+            min_score=min_score,
+            country=country,
+            proxy_type=proxy_type,
+        )
         if not records:
             await self.refresh_once(force_collect=True, force_verify=True)
-            records = self.ranked_records(limit=pool_limit, min_score=min_score)
+            records = self.ranked_records(
+                limit=pool_limit,
+                min_score=min_score,
+                country=country,
+                proxy_type=proxy_type,
+            )
         if not records:
             return {
                 "ok": False,
@@ -1081,6 +1769,19 @@ class ProxyAPIService:
                 preferred = [r for r in records if r.proxy == preferred_url]
                 others = [r for r in records if r.proxy != preferred_url]
                 records = preferred + others
+
+        # Per-domain memory: prefer proxies that already worked for this host,
+        # push down ones that failed on it. Sticky choice stays first.
+        domain_host = _url_host(target_url)
+        if domain_host and records:
+            if session_id and self._sticky_sessions.get(session_id):
+                sticky_proxy = self._sticky_sessions[session_id]
+                head = [r for r in records if r.proxy == sticky_proxy][:1]
+                tail = [r for r in records if r.proxy != sticky_proxy]
+                tail.sort(key=lambda r: (-r.domain_net(domain_host), -r.score))
+                records = head + tail
+            else:
+                records.sort(key=lambda r: (-r.domain_net(domain_host), -r.score))
 
         # Skip proxies on cooldown (per-proxy rate limiting)
         if min_proxy_interval > 0:
@@ -1110,112 +1811,139 @@ class ProxyAPIService:
         ):
             records_to_try = records_to_try[1:] + records_to_try[:1]
 
+        effective_client = (
+            http_client if http_client in ("aiohttp", "curl_cffi") else "auto"
+        )
+        if effective_client == "auto":
+            effective_client = (
+                "curl_cffi"
+                if str(getattr(self.args, "fetch_client", "auto")).lower()
+                == "curl_cffi"
+                else "aiohttp"
+            )
+
         for index, record in enumerate(records_to_try, start=1):
             proxy_url = parse_proxy_url(record.proxy)
 
             headers_for_request = sanitize_outbound_headers(headers or {})
 
-            if rotate_ua:
-                # Inject full humanized browser fingerprint; caller headers take priority
+            if rotate_ua and effective_client == "aiohttp":
+                # Inject full humanized browser fingerprint; caller headers take priority.
+                # (curl_cffi impersonation supplies its own consistent Chrome headers.)
                 browser_hdrs = get_random_browser_headers()
                 for hdr_key, hdr_val in browser_hdrs.items():
                     if hdr_key not in headers_for_request:
                         headers_for_request[hdr_key] = hdr_val
 
-            session = self.request_session
-            close_session = False
-            request_kwargs = {
-                "method": method.upper(),
-                "url": target_url,
-                "headers": headers_for_request,
-                "data": body,
-                "timeout": timeout_config,
-                "allow_redirects": allow_redirects,
-            }
-
             try:
-                if proxy_url.startswith("socks"):
-                    connector = create_proxy_connector(proxy_url, max_concurrent=1)
-                    session = aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=timeout_config,
-                        trust_env=False,
+                if effective_client == "curl_cffi":
+                    (
+                        status_code,
+                        reason_text,
+                        final_url_text,
+                        resp_headers,
+                        payload_bytes,
+                    ) = await self._curl_request(
+                        target_url=target_url,
+                        method=method,
+                        headers=headers_for_request,
+                        body=body,
+                        proxy_url=proxy_url,
+                        timeout=timeout or self.args.request_timeout,
+                        allow_redirects=allow_redirects,
+                        max_response_bytes=max_response_bytes,
                     )
-                    close_session = True
                 else:
-                    request_kwargs["proxy"] = proxy_url
-
-                async with session.request(**request_kwargs) as response:
-                    payload_bytes = await response.content.read(max_response_bytes + 1)
-                    truncated = len(payload_bytes) > max_response_bytes
-                    payload_bytes = payload_bytes[:max_response_bytes]
-                    attempt = {
-                        "attempt": index,
-                        "proxy": record.proxy,
-                        "proxy_url": proxy_url,
-                        "score": record.score,
-                        "status_code": response.status,
-                        "final_url": str(response.url),
-                    }
-                    # Auto-detect block pages / rate-limiting and skip to next proxy
-                    if detect_block_pages and _is_blocked_response(response.status, payload_bytes[:512]):
-                        attempt["error"] = f"blocked: status={response.status}"
-                        attempts.append(attempt)
-                        self._record_runtime_failure(
-                            record,
-                            attempt["error"],
-                            target_url,
-                        )
-                        if proxy_delay > 0:
-                            await asyncio.sleep(proxy_delay)
-                        continue
-                    if _expected and response.status not in _expected:
-                        attempt["error"] = (
-                            f"expected {sorted(_expected)}, got {response.status}"
-                        )
-                        attempts.append(attempt)
-                        self._record_runtime_failure(
-                            record,
-                            attempt["error"],
-                            target_url,
-                        )
-                        if proxy_delay > 0:
-                            await asyncio.sleep(proxy_delay)
-                        continue
-
-                    record.mark_used()
-                    self._last_proxy_used = record.proxy
-                    if session_id:
-                        self._update_sticky(session_id, record.proxy)
-
-                    # Binary vs text detection for body encoding
-                    content_type = response.headers.get("Content-Type", "").lower()
-                    is_text_response = any(
-                        content_type.startswith(prefix)
-                        for prefix in ("text/", "application/json", "application/xml",
-                                       "application/javascript", "application/x-www-form-urlencoded")
+                    (
+                        status_code,
+                        reason_text,
+                        final_url_text,
+                        resp_headers,
+                        payload_bytes,
+                    ) = await self._aiohttp_request(
+                        proxy_url=proxy_url,
+                        method=method,
+                        target_url=target_url,
+                        headers=headers_for_request,
+                        body=body,
+                        timeout_config=timeout_config,
+                        allow_redirects=allow_redirects,
+                        max_response_bytes=max_response_bytes,
                     )
 
-                    return {
-                        "ok": True,
-                        "proxy": record.proxy,
-                        "proxy_url": proxy_url,
-                        "proxy_score": record.score,
-                        "proxy_country": record.country,
-                        "proxy_anonymity": record.anonymity,
-                        "proxy_protocol": record.protocol,
-                        "attempts": attempts + [attempt],
-                        "status_code": response.status,
-                        "reason": response.reason,
-                        "final_url": str(response.url),
-                        "headers": dict(response.headers),
-                        "body_bytes": payload_bytes,
-                        "body_text": payload_bytes.decode("utf-8", errors="replace") if is_text_response else None,
-                        "body_base64": base64.b64encode(payload_bytes).decode("ascii") if not is_text_response else None,
-                        "body_encoding": "text" if is_text_response else "base64",
-                        "truncated": truncated,
-                        "max_response_bytes": max_response_bytes,
-                    }
+                truncated = len(payload_bytes) > max_response_bytes
+                payload_bytes = payload_bytes[:max_response_bytes]
+                attempt = {
+                    "attempt": index,
+                    "proxy": record.proxy,
+                    "proxy_url": proxy_url,
+                    "score": record.score,
+                    "status_code": status_code,
+                    "final_url": final_url_text,
+                }
+                # Auto-detect block pages / rate-limiting and skip to next proxy
+                if detect_block_pages and _is_blocked_response(status_code, payload_bytes[:512]):
+                    attempt["error"] = f"blocked: status={status_code}"
+                    attempts.append(attempt)
+                    self._record_runtime_failure(
+                        record,
+                        attempt["error"],
+                        target_url,
+                    )
+                    if proxy_delay > 0:
+                        await asyncio.sleep(proxy_delay)
+                    continue
+                if _expected and status_code not in _expected:
+                    attempt["error"] = (
+                        f"expected {sorted(_expected)}, got {status_code}"
+                    )
+                    attempts.append(attempt)
+                    self._record_runtime_failure(
+                        record,
+                        attempt["error"],
+                        target_url,
+                    )
+                    if proxy_delay > 0:
+                        await asyncio.sleep(proxy_delay)
+                    continue
+
+                record.mark_used()
+                self._last_proxy_used = record.proxy
+                self._record_runtime_success(record, target_url)
+                if session_id:
+                    self._update_sticky(session_id, record.proxy)
+
+                # Binary vs text detection for body encoding
+                content_type = _header_get(resp_headers, "Content-Type").lower()
+                is_text_response = any(
+                    content_type.startswith(prefix)
+                    for prefix in ("text/", "application/json", "application/xml",
+                                   "application/javascript", "application/x-www-form-urlencoded")
+                )
+
+                return {
+                    "ok": True,
+                    "route": "pool",
+                    "http_client": effective_client,
+                    "proxy": record.proxy,
+                    "proxy_url": proxy_url,
+                    "proxy_score": record.score,
+                    "proxy_country": record.country,
+                    "proxy_anonymity": record.anonymity,
+                    "proxy_protocol": record.protocol,
+                    "proxy_type": record.proxy_type,
+                    "attempts": attempts + [attempt],
+                    "status_code": status_code,
+                    "reason": reason_text,
+                    "final_url": final_url_text,
+                    "headers": resp_headers,
+                    "body_bytes": payload_bytes,
+                    "body_text": payload_bytes.decode("utf-8", errors="replace") if is_text_response else None,
+                    "body_base64": base64.b64encode(payload_bytes).decode("ascii") if not is_text_response else None,
+                    "body_encoding": "text" if is_text_response else "base64",
+                    "truncated": truncated,
+                    "max_response_bytes": max_response_bytes,
+                }
             except Exception as exc:
                 error_name = exc.__class__.__name__
                 attempts.append(
@@ -1231,16 +1959,11 @@ class ProxyAPIService:
 
                 if proxy_delay > 0:
                     await asyncio.sleep(proxy_delay)
-            finally:
-                if close_session and session is not None:
-                    try:
-                        await session.close()
-                    except Exception:
-                        pass
 
         return {
             "ok": False,
             "error": "all proxy attempts failed",
+            "route": "pool",
             "attempts": attempts,
         }
 
@@ -1319,10 +2042,15 @@ class ProxyTunnel:
             await self._server.wait_closed()
             self._server = None
 
-    def _pick_proxies(self) -> list:
-        """Return a shuffled selection of the best active proxies."""
+    def _pick_proxies(self, country: Optional[str] = None) -> list:
+        """Return a shuffled selection of the best active proxies.
+
+        country: optional ISO-2 pin taken from the tunnel username
+        (proxy-<cc>), so a single connection can force e.g. a Singapore exit
+        without moving the rest of the pool.
+        """
         records = self.service.ranked_records(
-            limit=self.max_attempts * 2, min_score=0.0,
+            limit=self.max_attempts * 2, min_score=0.0, country=country,
         )
         if not records:
             return []
@@ -1350,9 +2078,22 @@ class ProxyTunnel:
                 headers[key.strip()] = value.strip()
         return headers
 
-    def _is_authorized(self, headers: Dict[str, str]) -> bool:
+    def _parse_credentials(
+        self, headers: Dict[str, str]
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Validate Proxy-Authorization and extract an optional country pin.
+
+        Accepted usernames (password is always the tunnel key):
+          proxy                -> any country (classic behaviour)
+          proxy-<cc>           -> pin the exit country, e.g. proxy-sg
+          proxy-country-<cc>   -> provider-style alias, e.g. proxy-country-sg
+
+        Returns (username, country_iso2_or_None) when auth passes, else None.
+        The country pin lets the engine route, say, Lazada through a Singapore
+        exit in a single scoped route instead of moving the whole pool.
+        """
         if not self.auth_key:
-            return True
+            return (self.auth_user, None)
 
         auth_value = ""
         for key, value in headers.items():
@@ -1360,17 +2101,34 @@ class ProxyTunnel:
                 auth_value = value
                 break
         if not auth_value.lower().startswith("basic "):
-            return False
+            return None
 
         try:
             decoded = base64.b64decode(auth_value.split(None, 1)[1]).decode(
                 "utf-8", errors="replace"
             )
         except Exception:
-            return False
+            return None
 
-        expected = f"{self.auth_user}:{self.auth_key}"
-        return hmac.compare_digest(decoded, expected)
+        if ":" not in decoded:
+            return None
+        username, password = decoded.split(":", 1)
+        if not hmac.compare_digest(password, self.auth_key):
+            return None
+
+        username_norm = username.strip().lower()
+        base_user = self.auth_user.strip().lower()
+        if username_norm == base_user:
+            return (username, None)
+        prefix = f"{base_user}-"
+        if not username_norm.startswith(prefix):
+            return None
+        suffix = username_norm[len(prefix):].strip()
+        if suffix.startswith("country-"):
+            suffix = suffix[len("country-"):].strip()
+        if len(suffix) == 2 and suffix.isalpha():
+            return (username, suffix.upper())
+        return None
 
     async def _send_proxy_auth_required(
         self, client_writer: asyncio.StreamWriter
@@ -1398,20 +2156,22 @@ class ProxyTunnel:
             decoded = first_line.decode("latin-1", errors="replace").strip()
             headers = await self._read_request_headers(client_reader)
 
-            if not self._is_authorized(headers):
+            credentials = self._parse_credentials(headers)
+            if credentials is None:
                 await self._send_proxy_auth_required(client_writer)
                 self._stats["failed"] += 1
                 return
+            _username, country = credentials
 
             if decoded.upper().startswith("CONNECT "):
                 self._stats["connect_requests"] += 1
                 await self._handle_connect(
-                    decoded, headers, client_reader, client_writer
+                    decoded, headers, client_reader, client_writer, country
                 )
             else:
                 self._stats["http_requests"] += 1
                 await self._handle_plain_http(
-                    decoded, headers, client_reader, client_writer,
+                    decoded, headers, client_reader, client_writer, country,
                 )
         except Exception:
             pass
@@ -1430,6 +2190,7 @@ class ProxyTunnel:
         headers: Dict[str, str],
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
+        country: Optional[str] = None,
     ) -> None:
         parts = request_line.split()
         if len(parts) < 2:
@@ -1455,9 +2216,14 @@ class ProxyTunnel:
             self._stats["failed"] += 1
             return
 
-        proxies = self._pick_proxies()
+        proxies = self._pick_proxies(country)
         if not proxies:
-            client_writer.write(b"HTTP/1.1 502 No Proxies Available\r\n\r\n")
+            if country:
+                client_writer.write(
+                    f"HTTP/1.1 502 No Proxies Available For Country {country}\r\n\r\n".encode()
+                )
+            else:
+                client_writer.write(b"HTTP/1.1 502 No Proxies Available\r\n\r\n")
             await client_writer.drain()
             self._stats["failed"] += 1
             return
@@ -1503,7 +2269,8 @@ class ProxyTunnel:
                 )
                 continue
 
-        client_writer.write(b"HTTP/1.1 502 All Proxies Failed\r\n\r\n")
+        message = "All Proxies Failed" + (f" (country={country})" if country else "")
+        client_writer.write(f"HTTP/1.1 502 {message}\r\n\r\n".encode())
         await client_writer.drain()
         self._stats["failed"] += 1
 
@@ -1517,6 +2284,12 @@ class ProxyTunnel:
     ) -> bool:
         """Open a CONNECT tunnel through an upstream HTTP proxy."""
         stripped = proxy_url.split("://", 1)[-1]
+        auth_header = ""
+        if "@" in stripped:
+            credentials, stripped = stripped.rsplit("@", 1)
+            if credentials:
+                token = base64.b64encode(credentials.encode()).decode()
+                auth_header = f"Proxy-Authorization: Basic {token}\r\n"
         if ":" in stripped:
             p_host, p_port_str = stripped.rsplit(":", 1)
             p_port = int(p_port_str)
@@ -1532,7 +2305,8 @@ class ProxyTunnel:
         try:
             connect_req = (
                 f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                f"{auth_header}\r\n"
             ).encode()
             up_writer.write(connect_req)
             await up_writer.drain()
@@ -1644,8 +2418,12 @@ class ProxyTunnel:
         request_headers: Dict[str, str],
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
+        country: Optional[str] = None,
     ) -> None:
-        """Forward a plain HTTP request through the proxy pool."""
+        """Forward a plain HTTP request through the proxy pool.
+
+        country: optional ISO-2 pin from the tunnel username (proxy-<cc>).
+        """
         parts = request_line.split(None, 2)
         if len(parts) < 3:
             client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -1690,6 +2468,7 @@ class ProxyTunnel:
             headers=headers,
             body=body,
             max_attempts=self.max_attempts,
+            country=country,
         )
 
         if not result.get("ok"):
@@ -1743,8 +2522,12 @@ async def parse_fetch_request(
             "allow_redirects": request.query.get("allow_redirects", "true").lower()
             != "false",
             "session_id": request.query.get("session_id") or None,
+            "country": (request.query.get("country") or "").strip().upper() or None,
+            "proxy_type": request.query.get("proxy_type") or None,
             "min_proxy_interval": float(request.query.get("min_proxy_interval", "0")),
             "detect_block_pages": request.query.get("detect_block_pages", "true").lower() != "false",
+            "route": (request.query.get("route") or "auto").strip().lower(),
+            "http_client": (request.query.get("http_client") or "auto").strip().lower(),
             "headers": {},
             "body": None,
         }
@@ -1778,7 +2561,7 @@ async def parse_fetch_request(
 
         return {
             "url": str(payload.get("url", "")).strip(),
-            "method": str(payload.get("method", default_method or request.method)),
+            "method": str(payload.get("method") or "GET"),
             "timeout": float(payload["timeout"]) if payload.get("timeout") else None,
             "max_attempts": int(payload.get("max_attempts", 10)),
             "expected_status": int(payload["expected_status"])
@@ -1789,8 +2572,12 @@ async def parse_fetch_request(
             "min_score": float(payload.get("min_score", 0)),
             "allow_redirects": bool(payload.get("allow_redirects", True)),
             "session_id": str(payload["session_id"]) if payload.get("session_id") else None,
+            "country": str(payload["country"]).strip().upper() if payload.get("country") else None,
+            "proxy_type": str(payload["proxy_type"]) if payload.get("proxy_type") else None,
             "min_proxy_interval": float(payload.get("min_proxy_interval", 0)),
             "detect_block_pages": bool(payload.get("detect_block_pages", True)),
+            "route": str(payload.get("route") or "auto").strip().lower(),
+            "http_client": str(payload.get("http_client") or "auto").strip().lower(),
             "headers": {
                 str(k): str(v) for k, v in dict(payload.get("headers", {})).items()
             },
@@ -1811,7 +2598,11 @@ async def parse_fetch_request(
         "allow_redirects": request.query.get("allow_redirects", "true").lower()
         != "false",
         "session_id": request.query.get("session_id") or None,
+        "country": (request.query.get("country") or "").strip().upper() or None,
+        "proxy_type": request.query.get("proxy_type") or None,
         "min_proxy_interval": float(request.query.get("min_proxy_interval", "0")),
+        "route": (request.query.get("route") or "auto").strip().lower(),
+        "http_client": (request.query.get("http_client") or "auto").strip().lower(),
         "headers": sanitize_outbound_headers(dict(request.headers)),
         "body": raw_body or None,
     }
@@ -1928,6 +2719,48 @@ async def handle_tunnel_status(request: web.Request) -> web.Response:
     })
 
 
+async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+    """GET /ws — live pool snapshot stream (JSON every 2 seconds).
+
+    Same auth as the REST API (X-API-Key header). Python websocket clients can
+    set headers; browsers cannot — use a small server-side relay if needed.
+
+    Example::
+
+        from websockets.sync.client import connect
+        with connect("ws://127.0.0.1:1712/ws",
+                     additional_headers={"X-API-Key": KEY}) as ws:
+            for message in ws:
+                print(message)
+    """
+    service: ProxyAPIService = request.app["service"]
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    try:
+        while not ws.closed:
+            try:
+                payload = service.status_payload()
+                await ws.send_json({
+                    "type": "pool",
+                    "updated_at": payload.get("updated_at"),
+                    "active_proxies": payload.get("active_proxies", 0),
+                    "known_records": payload.get("known_records", 0),
+                    "residential_active": payload.get("residential_active", 0),
+                    "tor_active": payload.get("tor_active", 0),
+                    "best_proxy": payload.get("best_proxy", ""),
+                    "progress": payload.get("progress", {}),
+                    "last_summary": payload.get("last_summary", {}),
+                })
+            except (ConnectionResetError, RuntimeError):
+                break
+            await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await ws.close()
+    return ws
+
+
 async def handle_proxies(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
     limit = int(request.query.get("limit", "50"))
@@ -1935,6 +2768,8 @@ async def handle_proxies(request: web.Request) -> web.Response:
     protocol = request.query.get("protocol") or None
     country = request.query.get("country") or None
     anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
     proxies = [
         record.to_dict()
         for record in service.ranked_records(
@@ -1943,6 +2778,8 @@ async def handle_proxies(request: web.Request) -> web.Response:
             protocol=protocol,
             country=country,
             anonymity=anonymity,
+            proxy_type=proxy_type,
+            platform=platform,
         )
     ]
     return web.json_response({"ok": True, "count": len(proxies), "proxies": proxies})
@@ -1956,12 +2793,16 @@ async def handle_next(request: web.Request) -> web.Response:
     protocol = request.query.get("protocol") or None
     country = request.query.get("country") or None
     anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
     min_score = float(request.query.get("min_score", "0"))
     skip_cooldown = float(request.query.get("skip_cooldown", "0"))
     record = service.harvester.next_proxy(
         protocol=protocol,
         country=country,
         anonymity=anonymity,
+        proxy_type=proxy_type,
+        platform=platform,
         min_score=min_score,
         skip_cooldown=skip_cooldown,
     )
@@ -1974,6 +2815,9 @@ async def handle_next(request: web.Request) -> web.Response:
         "protocol": record.protocol,
         "country": record.country,
         "anonymity": record.anonymity,
+        "proxy_type": record.proxy_type,
+        "platforms": dict(record.platforms),
+        "manual": record.manual,
         "score": round(record.score, 4),
         "avg_response_time": round(record.avg_response_time, 3),
         "success_rate": round(record.success_rate, 4),
@@ -1988,9 +2832,16 @@ async def handle_random(request: web.Request) -> web.Response:
     protocol = request.query.get("protocol") or None
     country = request.query.get("country") or None
     anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
     min_score = float(request.query.get("min_score", "0"))
     records = service.harvester._filtered_records(
-        protocol=protocol, country=country, anonymity=anonymity, min_score=min_score
+        protocol=protocol,
+        country=country,
+        anonymity=anonymity,
+        proxy_type=proxy_type,
+        platform=platform,
+        min_score=min_score,
     )
     if not records:
         return json_error("no proxy matching criteria", status=404)
@@ -2002,6 +2853,9 @@ async def handle_random(request: web.Request) -> web.Response:
         "protocol": record.protocol,
         "country": record.country,
         "anonymity": record.anonymity,
+        "proxy_type": record.proxy_type,
+        "platforms": dict(record.platforms),
+        "manual": record.manual,
         "score": round(record.score, 4),
         "avg_response_time": round(record.avg_response_time, 3),
         "success_rate": round(record.success_rate, 4),
@@ -2018,6 +2872,8 @@ async def handle_stats(request: web.Request) -> web.Response:
     by_protocol: Dict[str, int] = {}
     by_country: Dict[str, int] = {}
     by_anonymity: Dict[str, int] = {}
+    by_type: Dict[str, int] = {}
+    by_platform: Dict[str, int] = {}
     total_score = 0.0
     total_rtt = 0.0
     count_rtt = 0
@@ -2029,6 +2885,11 @@ async def handle_stats(request: web.Request) -> web.Response:
             by_country[r.country] = by_country.get(r.country, 0) + 1
         anon_key = r.anonymity or "unknown"
         by_anonymity[anon_key] = by_anonymity.get(anon_key, 0) + 1
+        type_key = r.proxy_type or "unclassified"
+        by_type[type_key] = by_type.get(type_key, 0) + 1
+        for platform_name, platform_ok in r.platforms.items():
+            if platform_ok:
+                by_platform[platform_name] = by_platform.get(platform_name, 0) + 1
         total_score += r.score
         if r.avg_response_time > 0:
             total_rtt += r.avg_response_time
@@ -2040,10 +2901,66 @@ async def handle_stats(request: web.Request) -> web.Response:
         "by_protocol": by_protocol,
         "by_country": dict(sorted(by_country.items(), key=lambda x: -x[1])[:30]),
         "by_anonymity": by_anonymity,
+        "by_type": by_type,
+        "by_platform": by_platform,
+        "platforms_enabled": getattr(service.args, "platform_probes", "") or "",
+        "residential_count": by_type.get("residential", 0),
+        "tor_count": by_type.get("tor", 0),
+        "manual_count": sum(1 for r in records if r.manual),
         "avg_score": round(total_score / len(records), 4) if records else 0.0,
         "avg_response_time": round(total_rtt / count_rtt, 3) if count_rtt else 0.0,
         "enriched_count": sum(1 for r in records if r.anonymity),
         "geolocated_count": sum(1 for r in records if r.country),
+        "typed_count": sum(1 for r in records if r.proxy_type),
+        "unlock_calls": getattr(service, "_unlock_calls", 0),
+        "unlock_success": getattr(service, "_unlock_success", 0),
+        "unlock_configured": service._unlock_configured(),
+        "direct_calls": getattr(service, "_direct_calls", 0),
+        "fetch_client": getattr(service.args, "fetch_client", "auto"),
+        "direct_client": getattr(service.args, "direct_client", "curl_cffi"),
+    })
+
+
+# ISO 3166-1 alpha-2 country codes (so /coverage can report which countries
+# have no active proxy yet — useful for multi-country scrapers).
+ISO_ALPHA2_COUNTRIES = (
+    "ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz "
+    "ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo "
+    "fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it "
+    "je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn "
+    "mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt "
+    "pw py qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl "
+    "tm tn to tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw"
+)
+
+
+async def handle_coverage(request: web.Request) -> web.Response:
+    """Country coverage report: active proxies per country + missing ISO-3166 codes."""
+    service: ProxyAPIService = request.app["service"]
+    if not service.harvester:
+        return json_error("service not ready", status=503)
+
+    covered: Dict[str, int] = {}
+    for record in service.harvester.ranked_active_records():
+        code = (record.country or "").upper()
+        if code:
+            covered[code] = covered.get(code, 0) + 1
+
+    target = set(ISO_ALPHA2_COUNTRIES.upper().split())
+    covered_target = {code: count for code, count in covered.items() if code in target}
+    missing = sorted(target - set(covered_target))
+
+    return web.json_response({
+        "ok": True,
+        "target_countries": len(target),
+        "covered_countries": len(covered_target),
+        "coverage_percent": round(len(covered_target) / len(target) * 100, 1)
+        if target
+        else 0.0,
+        "by_country": dict(
+            sorted(covered_target.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        "missing": missing,
     })
 
 
@@ -2070,19 +2987,26 @@ async def handle_fetch_json(request: web.Request) -> web.Response:
         min_score=options["min_score"],
         allow_redirects=options["allow_redirects"],
         session_id=options.get("session_id"),
+        country=options.get("country"),
+        proxy_type=options.get("proxy_type"),
         min_proxy_interval=options.get("min_proxy_interval", 0.0),
         detect_block_pages=options.get("detect_block_pages", True),
+        route=options.get("route", "auto"),
+        http_client=options.get("http_client", "auto"),
     )
     if not result["ok"]:
         return web.json_response(result, status=502)
 
     payload = {
         "ok": True,
+        "route": result.get("route", "pool"),
+        "http_client": result.get("http_client", ""),
         "proxy": result["proxy"],
         "proxy_score": result["proxy_score"],
         "proxy_country": result.get("proxy_country", ""),
         "proxy_anonymity": result.get("proxy_anonymity", ""),
         "proxy_protocol": result.get("proxy_protocol", ""),
+        "proxy_type": result.get("proxy_type", ""),
         "status_code": result["status_code"],
         "reason": result["reason"],
         "final_url": result["final_url"],
@@ -2098,7 +3022,7 @@ async def handle_fetch_json(request: web.Request) -> web.Response:
 
 async def handle_proxy_raw(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
-    options = await parse_fetch_request(request, default_method=request.method)
+    options = await parse_fetch_request(request)
     target_url = options["url"]
     if not await is_valid_target_url(target_url):
         return json_error(
@@ -2119,14 +3043,20 @@ async def handle_proxy_raw(request: web.Request) -> web.Response:
         min_score=options["min_score"],
         allow_redirects=options["allow_redirects"],
         session_id=options.get("session_id"),
+        country=options.get("country"),
+        proxy_type=options.get("proxy_type"),
         min_proxy_interval=options.get("min_proxy_interval", 0.0),
         detect_block_pages=options.get("detect_block_pages", True),
+        route=options.get("route", "auto"),
+        http_client=options.get("http_client", "auto"),
     )
     if not result["ok"]:
         return web.json_response(result, status=502)
 
     headers = sanitize_inbound_response_headers(result["headers"])
     headers["X-Proxy-Used"] = result["proxy"]
+    headers["X-Route"] = result.get("route", "pool")
+    headers["X-Proxy-Type"] = result.get("proxy_type", "")
     headers["X-Proxy-Score"] = str(result["proxy_score"])
     headers["X-Proxy-Attempts"] = str(len(result["attempts"]))
     headers["X-Final-URL"] = result["final_url"]
@@ -2169,10 +3099,12 @@ async def create_app(args: argparse.Namespace) -> web.Application:
     app.router.add_get("/next", handle_next)
     app.router.add_get("/random", handle_random)
     app.router.add_get("/stats", handle_stats)
+    app.router.add_get("/coverage", handle_coverage)
     app.router.add_route("*", "/proxy", handle_proxy_raw)
     app.router.add_route("*", "/fetch", handle_fetch_json)
     app.router.add_post("/reload", handle_reload)
     app.router.add_get("/tunnel-status", handle_tunnel_status)
+    app.router.add_get("/ws", handle_ws)
     return app
 
 
@@ -2236,10 +3168,11 @@ async def run_server(args: argparse.Namespace) -> None:
         print("\n  Auth: DISABLED (use --api-key to enable)")
     print("\nAPI Endpoints:")
     print(f"  GET  {preferred_url}/status")
-    print(f"  GET  {preferred_url}/stats                  -- pool breakdown by protocol/country/anonymity")
-    print(f"  GET  {preferred_url}/proxies                -- list proxies (?protocol= &country= &anonymity= &min_score=)")
-    print(f"  GET  {preferred_url}/next                   -- round-robin next proxy (?protocol= &country= &anonymity=)")
-    print(f"  GET  {preferred_url}/random                 -- random proxy from pool (?protocol= &country= &anonymity=)")
+    print(f"  GET  {preferred_url}/stats                  -- pool breakdown by protocol/country/anonymity/type")
+    print(f"  GET  {preferred_url}/coverage               -- active proxies per country + missing ISO-3166 countries")
+    print(f"  GET  {preferred_url}/proxies                -- list proxies (?protocol= &country= &anonymity= &proxy_type= &min_score=)")
+    print(f"  GET  {preferred_url}/next                   -- round-robin next proxy (?protocol= &country= &anonymity= &proxy_type=)")
+    print(f"  GET  {preferred_url}/random                 -- random proxy from pool (?protocol= &country= &anonymity= &proxy_type=)")
     print(f"  GET  {preferred_url}/proxy?url=https://example.com  -- fetch URL through rotating proxy")
     print(f"  POST {preferred_url}/fetch                  -- JSON body: {{url, method, headers, session_id, ...}}")
     print(f"  POST {preferred_url}/reload                 -- force immediate pool refresh")
@@ -2282,6 +3215,20 @@ async def run_server(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Crash visibility: faulthandler dumps the Python stack on hard crashes
+    # (the missing piece in the 2026-10-17 silent-death incident — see
+    # RESEARCH §2.4), and line buffering keeps stdout/stderr usable even when
+    # the service is started without `-u`.
+    try:
+        faulthandler.enable()
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = build_parser()
     args = parser.parse_args()
     args = ensure_secure_runtime_args(args)

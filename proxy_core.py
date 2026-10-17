@@ -36,7 +36,7 @@ DEFAULT_USER_AGENT = "ProxyGenerator/2.0 (+local pool manager)"
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
     "https://httpbin.org/ip",
-    "http://api.ipify.org?format=json",
+    "https://example.com/",
 )
 DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all.txt",
@@ -121,18 +121,56 @@ DEFAULT_SOURCES = (
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=socks5",
 )
 
+# ---------------------------------------------------------------------------
+# Country-targeted free proxy lists ({cc} = lower ISO-2, {CC} = upper ISO-2).
+# Every fetched record from these sources is pre-tagged with the list country,
+# so per-country coverage grows even before geo enrichment has seen it.
+# ---------------------------------------------------------------------------
+COUNTRY_SOURCE_TEMPLATES = (
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&country={cc}&proxy_format=protocolipport&format=text",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/{CC}/data.txt",
+)
+
+# Countries queried by default (ISO-2, lowercase).
+DEFAULT_COUNTRY_SOURCE_CODES = (
+    "ae af al am ao ar at au az ba bd be bf bg bh bi bj bn bo br bt bw by bz "
+    "ca cd cf cg ch ci cl cm cn co cr cu cv cy cz de dj dk do dz ec ee eg es et "
+    "fi fj fr ga ge gh gi gm gn gr gt gw gy hk hn hr ht hu id ie il in iq ir is "
+    "it jm jo jp ke kg kh ki km kn kr kw kz la lb lc lk lr ls lt lu lv ly ma md "
+    "me mg mk ml mm mn mo mt mu mv mw mx my mz na ne ng ni nl no np om pa pe pg "
+    "ph pk pl pr ps pt py qa ro rs ru rw sa sb sc sd se sg si sk sl sn so sr st "
+    "sv sy sz td tg th tj tl tm tn to tr tt tw tz ua ug us uy uz vc ve vn ye za "
+    "zm zw"
+)
+
 PROXY_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b")
+PROXY_WITH_SCHEME_PATTERN = re.compile(
+    r"\b(?:https?|socks5h?|socks4a?)://(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b"
+)
 PROXY_WITH_AUTH_PATTERN = re.compile(
-    r"(?:http|socks4|socks5)://[\w\-]+:[\w\-]+@(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}"
+    r"(?:(?:http|socks4|socks5)://)?"
+    r"[A-Za-z0-9_.\-%!$]+:[A-Za-z0-9_.\-%!$]+@(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}"
 )
 
 # Enrichment endpoints
 ANONYMITY_CHECK_URL = "http://httpbin.org/headers"
-GEO_API_URL = "http://ip-api.com/json/{ip}?fields=status,countryCode"
+GEO_API_URL = (
+    "http://ip-api.com/json/{ip}?fields=status,countryCode,hosting,mobile,isp"
+)
 _GEO_ENRICH_CONCURRENCY = 1
 _GEO_DELAY_SECONDS = 1.4  # ~42 req/min to stay below ip-api.com free limits
-_ANONYMITY_ENRICH_CONCURRENCY = 15
-_ENRICH_BATCH_SIZE = 25
+_GEO_FAST_URL = "https://get.geojs.io/v1/ip/geo/{ip}.json"  # free, no key, no cap
+_GEO_FAST_CONCURRENCY = 32
+_TYPE_ENRICH_PER_CYCLE = 45  # ip-api.com budget per cycle (45 req/min free tier)
+_ANONYMITY_ENRICH_CONCURRENCY = 24
+_ENRICH_BATCH_SIZE = 120
+PLATFORM_PROBE_URLS = {
+    "telegram": "https://api.telegram.org/",
+    "instagram": "https://www.instagram.com/robots.txt",
+    "whatsapp": "https://www.whatsapp.com/robots.txt",
+}
+_PLATFORM_PROBE_CONCURRENCY = 24
+_PLATFORM_REPROBE_SECONDS = 900.0
 
 
 def normalize_proxy(candidate: str) -> Optional[str]:
@@ -144,12 +182,21 @@ def normalize_proxy(candidate: str) -> Optional[str]:
     if "://" in value:
         scheme, rest = value.split("://", 1)
         scheme = scheme.lower()
-        if scheme in ("http", "https", "socks4", "socks5"):
+        if scheme in ("http", "https"):
             protocol = scheme
+        elif scheme in ("socks4", "socks4a"):
+            protocol = "socks4"
+        elif scheme in ("socks5", "socks5h"):
+            protocol = "socks5"
         value = rest
 
+    # Keep credentials (user:pass@) — required for paid/residential proxies.
+    auth = ""
     if "@" in value:
-        value = value.split("@", 1)[1]
+        auth, value = value.rsplit("@", 1)
+        auth = auth.strip()
+        if not auth or any(char.isspace() for char in auth):
+            return None
 
     if ":" not in value:
         return None
@@ -169,6 +216,68 @@ def normalize_proxy(candidate: str) -> Optional[str]:
     if not 1 <= port <= 65535:
         return None
 
+    if auth:
+        return f"{protocol}://{auth}@{host}:{port}"
+    return f"{protocol}://{host}:{port}"
+
+
+_IPV4_PATTERN = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,251}[A-Za-z0-9])?$")
+
+
+def normalize_manual_proxy(candidate: str) -> Optional[str]:
+    """Like normalize_proxy, but for user-supplied entries.
+
+    Additionally accepts hostnames (e.g. gate.provider.com:8080) so paid
+    residential providers that do not publish raw IPs can be used.
+    """
+    value = candidate.strip()
+    if not value:
+        return None
+
+    protocol = "http"
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        scheme = scheme.lower()
+        if scheme in ("http", "https"):
+            protocol = scheme
+        elif scheme in ("socks4", "socks4a"):
+            protocol = "socks4"
+        elif scheme in ("socks5", "socks5h"):
+            protocol = "socks5"
+        value = rest
+
+    if protocol == "https":
+        # Upstream proxies are spoken to over plain HTTP in this project.
+        protocol = "http"
+
+    auth = ""
+    if "@" in value:
+        auth, value = value.rsplit("@", 1)
+        auth = auth.strip()
+        if not auth or ":" not in auth or any(c.isspace() for c in auth):
+            return None
+
+    if ":" not in value:
+        return None
+
+    host, port_text = value.rsplit(":", 1)
+    host = host.strip()
+    if not host:
+        return None
+    if not (_IPV4_PATTERN.match(host) or _HOSTNAME_PATTERN.match(host)):
+        return None
+
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+
+    if not 1 <= port <= 65535:
+        return None
+
+    if auth:
+        return f"{protocol}://{auth}@{host}:{port}"
     return f"{protocol}://{host}:{port}"
 
 
@@ -252,13 +361,29 @@ def parse_datetime(value: str | None) -> datetime:
 
 def extract_proxies(text: str) -> Set[str]:
     proxies: Set[str] = set()
+    auth_hosts: Set[str] = set()
+    scheme_hosts: Set[str] = set()
+
+    # Scheme-aware pass first: keeps socks5/socks4 protocol info that would
+    # otherwise be lost (a socks5 endpoint probed as http always fails).
+    for raw_proxy in PROXY_WITH_SCHEME_PATTERN.findall(text):
+        normalized = normalize_proxy(raw_proxy)
+        if normalized:
+            proxies.add(normalized)
+            if "://" in normalized:
+                scheme_hosts.add(normalized.rsplit("://", 1)[1])
 
     for raw_proxy in PROXY_WITH_AUTH_PATTERN.findall(text):
         normalized = normalize_proxy(raw_proxy)
         if normalized:
             proxies.add(normalized)
+            auth_hosts.add(normalized.rsplit("@", 1)[1])
 
     for raw_proxy in PROXY_PATTERN.findall(text):
+        if raw_proxy in auth_hosts or raw_proxy in scheme_hosts:
+            # Same endpoint already extracted with credentials / scheme — skip
+            # the duplicate (it would just fail verification).
+            continue
         normalized = normalize_proxy(raw_proxy)
         if normalized:
             proxies.add(normalized)
@@ -363,14 +488,23 @@ async def check_proxy_anonymity(
         return ""
 
 
-async def lookup_proxy_country(
+def _classify_proxy_type(geo: Dict[str, Any]) -> str:
+    """Map ip-api.com geo data to a proxy type label."""
+    if geo.get("mobile"):
+        return "mobile"
+    if geo.get("hosting"):
+        return "datacenter"
+    return "residential"
+
+
+async def lookup_proxy_geo(
     session: aiohttp.ClientSession,
     ip: str,
     timeout_seconds: float = 5.0,
-) -> str:
-    """Return ISO-2 country code for *ip* using ip-api.com, or '' on failure."""
+) -> Dict[str, Any]:
+    """Return {"country", "proxy_type"} for *ip* via ip-api.com, or {} on failure."""
     if not ip:
-        return ""
+        return {}
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with session.get(
@@ -378,13 +512,53 @@ async def lookup_proxy_country(
             timeout=timeout,
         ) as response:
             if response.status != 200:
+                return {}
+            data = await response.json(content_type=None)
+            if data.get("status") != "success":
+                return {}
+            return {
+                "country": str(data.get("countryCode", "")),
+                "proxy_type": _classify_proxy_type(data),
+            }
+    except Exception:
+        return {}
+
+
+async def lookup_proxy_country(
+    session: aiohttp.ClientSession,
+    ip: str,
+    timeout_seconds: float = 5.0,
+) -> str:
+    """Return ISO-2 country code for *ip* using ip-api.com, or '' on failure."""
+    geo = await lookup_proxy_geo(session, ip, timeout_seconds)
+    return str(geo.get("country", ""))
+
+
+async def lookup_country_fast(
+    session: aiohttp.ClientSession,
+    ip: str,
+    timeout_seconds: float = 5.0,
+) -> str:
+    """Return ISO-2 country code for *ip* via geojs.io, or '' on failure.
+
+    geojs.io is free, needs no key and has no practical rate cap, so country
+    fill runs fully parallel (concurrency 32) instead of the ip-api.com
+    sequential path that stays reserved for proxy-type classification.
+    """
+    if not ip:
+        return ""
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with session.get(
+            _GEO_FAST_URL.format(ip=ip),
+            timeout=timeout,
+        ) as response:
+            if response.status != 200:
                 return ""
             data = await response.json(content_type=None)
-            if data.get("status") == "success":
-                return str(data.get("countryCode", ""))
+            return str(data.get("country_code") or "").upper()
     except Exception:
         return ""
-    return ""
 
 
 @dataclass
@@ -404,6 +578,10 @@ class HarvesterConfig:
     max_response_time: float = 12.0
     output_file: str = DEFAULT_OUTPUT_FILE
     user_agent: str = DEFAULT_USER_AGENT
+    residential_file: str = "residential-proxies.txt"
+    tor_file: str = "tor-proxies.txt"
+    country_source_codes: str = "default"
+    platform_probes: str = ""  # e.g. "telegram,instagram,whatsapp" ("" = disabled)
     test_urls: List[str] = field(default_factory=lambda: list(DEFAULT_TEST_URLS))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -416,14 +594,30 @@ class HarvesterConfig:
             "auto_save_interval": self.auto_save_interval,
             "max_candidates": self.max_candidates,
             "verify_batch_size": self.verify_batch_size,
+            "platform_probes": self.platform_probes,
             "min_success_rate": self.min_success_rate,
             "max_consecutive_failures": self.max_consecutive_failures,
             "stale_after_seconds": self.stale_after_seconds,
             "max_response_time": self.max_response_time,
             "output_file": self.output_file,
             "user_agent": self.user_agent,
+            "residential_file": self.residential_file,
+            "tor_file": self.tor_file,
             "test_urls": list(self.test_urls),
         }
+
+
+def _safe_int_map(value: Any) -> Dict[str, int]:
+    """Parse a JSON payload into {str: int}, ignoring malformed entries."""
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, int] = {}
+    for key, item in value.items():
+        try:
+            result[str(key)] = int(item)
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 @dataclass
@@ -442,6 +636,12 @@ class ProxyRecord:
     last_origin: str = ""
     anonymity: str = ""   # "elite" | "anonymous" | "transparent" | ""
     country: str = ""     # ISO-2 country code or ""
+    proxy_type: str = ""  # "residential" | "mobile" | "datacenter" | ""
+    platforms: Dict[str, bool] = field(default_factory=dict)  # {"telegram": True, ...}
+    platforms_checked_at: float = 0.0  # time.monotonic() of last platform probe
+    manual: bool = False  # user-supplied entry (from residential-proxies.txt)
+    domain_ok: Dict[str, int] = field(default_factory=dict)    # per-host success memory
+    domain_fail: Dict[str, int] = field(default_factory=dict)  # per-host failure memory
     success_rate: float = 0.0
     avg_response_time: float = 0.0
     score: float = 0.0
@@ -465,6 +665,41 @@ class ProxyRecord:
         merged = set(self.source_urls)
         merged.update(urls)
         self.source_urls = sorted(merged)[:10]
+
+    # --- per-domain (target host) memory ---------------------------------
+    _MAX_DOMAIN_KEYS = 16
+
+    def note_domain_result(self, domain: str, success: bool) -> None:
+        """Remember how this proxy behaved for one target host.
+
+        Real fetch outcomes are recorded here so future requests to the same
+        host prefer proxies already proven to work for it (and skip ones that
+        failed before).
+        """
+        key = (domain or "").strip().lower()
+        if not key:
+            return
+        bucket = self.domain_ok if success else self.domain_fail
+        bucket[key] = bucket.get(key, 0) + 1
+        if len(self.domain_ok) + len(self.domain_fail) > self._MAX_DOMAIN_KEYS:
+            self._prune_domain_stats()
+
+    def domain_net(self, domain: str) -> int:
+        """Net score (successes - failures) recorded for a target host."""
+        key = (domain or "").strip().lower()
+        if not key:
+            return 0
+        return self.domain_ok.get(key, 0) - self.domain_fail.get(key, 0)
+
+    def _prune_domain_stats(self) -> None:
+        keys = sorted(
+            set(self.domain_ok) | set(self.domain_fail),
+            key=lambda item: self.domain_ok.get(item, 0) + self.domain_fail.get(item, 0),
+            reverse=True,
+        )
+        for key in keys[self._MAX_DOMAIN_KEYS:]:
+            self.domain_ok.pop(key, None)
+            self.domain_fail.pop(key, None)
 
     def record_success(
         self,
@@ -569,9 +804,14 @@ class ProxyRecord:
             "last_origin": self.last_origin,
             "anonymity": self.anonymity,
             "country": self.country,
+            "proxy_type": self.proxy_type,
+            "platforms": dict(self.platforms),
+            "manual": self.manual,
             "success_rate": round(self.success_rate, 6),
             "avg_response_time": round(self.avg_response_time, 4),
             "score": round(self.score, 6),
+            "domain_ok": dict(self.domain_ok),
+            "domain_fail": dict(self.domain_fail),
         }
 
     @classmethod
@@ -601,9 +841,17 @@ class ProxyRecord:
             last_origin=str(payload.get("last_origin", "")),
             anonymity=str(payload.get("anonymity", "")),
             country=str(payload.get("country", "")),
+            proxy_type=str(payload.get("proxy_type", "")),
+            platforms={
+                str(name): bool(ok)
+                for name, ok in (payload.get("platforms") or {}).items()
+            },
+            manual=bool(payload.get("manual", False)),
             success_rate=float(payload.get("success_rate", 0.0)),
             avg_response_time=float(payload.get("avg_response_time", 0.0)),
             score=float(payload.get("score", 0.0)),
+            domain_ok=_safe_int_map(payload.get("domain_ok")),
+            domain_fail=_safe_int_map(payload.get("domain_fail")),
         )
         record.recalculate(max_response_time)
         return record
@@ -779,6 +1027,8 @@ class ProxyHarvester:
     ):
         self.config = config
         self.sources = list(sources or DEFAULT_SOURCES)
+        self.source_country: Dict[str, str] = {}
+        self._apply_country_sources()
         self.progress_callback = progress_callback
         self.records: Dict[str, ProxyRecord] = {}
         self.active_proxies: Set[str] = set()
@@ -794,6 +1044,24 @@ class ProxyHarvester:
         if not self.progress_callback:
             return
         self.progress_callback(payload)
+
+    def _apply_country_sources(self) -> None:
+        """Append country-targeted list URLs and remember url -> ISO-2 code."""
+        raw = (self.config.country_source_codes or "").strip()
+        if not raw or raw.lower() in {"off", "none", "0", "false", "disabled"}:
+            return
+        if raw.lower() == "default":
+            raw = DEFAULT_COUNTRY_SOURCE_CODES
+        codes = [code for code in re.split(r"[\s,;]+", raw) if code]
+        for code in codes:
+            country_code = code.strip().upper()
+            if len(country_code) != 2 or not country_code.isalpha():
+                continue
+            for template in COUNTRY_SOURCE_TEMPLATES:
+                url = template.format(cc=country_code.lower(), CC=country_code)
+                if url not in self.sources:
+                    self.sources.append(url)
+                self.source_country[url] = country_code
 
     async def __aenter__(self) -> "ProxyHarvester":
         connector = aiohttp.TCPConnector(limit=self.config.max_concurrent, ssl=True)
@@ -847,6 +1115,8 @@ class ProxyHarvester:
         protocol: Optional[str] = None,
         country: Optional[str] = None,
         anonymity: Optional[str] = None,
+        proxy_type: Optional[str] = None,
+        platform: Optional[str] = None,
         min_score: float = 0.0,
         limit: Optional[int] = None,
     ) -> List[ProxyRecord]:
@@ -860,6 +1130,12 @@ class ProxyHarvester:
             records = [r for r in records if r.country.upper() == country.upper()]
         if anonymity:
             records = [r for r in records if r.anonymity == anonymity.lower()]
+        if proxy_type:
+            value = proxy_type.lower()
+            records = [r for r in records if r.proxy_type == value]
+        if platform:
+            platform_key = platform.lower()
+            records = [r for r in records if r.platforms.get(platform_key)]
         return records if limit is None else records[:limit]
 
     def next_proxy(
@@ -867,12 +1143,19 @@ class ProxyHarvester:
         protocol: Optional[str] = None,
         country: Optional[str] = None,
         anonymity: Optional[str] = None,
+        proxy_type: Optional[str] = None,
+        platform: Optional[str] = None,
         min_score: float = 0.0,
         skip_cooldown: float = 0.0,
     ) -> Optional[ProxyRecord]:
         """Round-robin: return next proxy matching criteria and advance the index."""
         records = self._filtered_records(
-            protocol=protocol, country=country, anonymity=anonymity, min_score=min_score
+            protocol=protocol,
+            country=country,
+            anonymity=anonymity,
+            proxy_type=proxy_type,
+            platform=platform,
+            min_score=min_score,
         )
         if skip_cooldown > 0:
             records = [r for r in records if not r.on_cooldown(skip_cooldown)]
@@ -885,14 +1168,14 @@ class ProxyHarvester:
         return record
 
     async def _enrich_pool(self) -> None:
-        """Detect anonymity level and country for active proxies that lack this data."""
+        """Detect anonymity level, country and proxy type for active proxies that lack this data."""
         if not self.session:
             return
         candidates = [
             record
             for proxy, record in self.records.items()
             if proxy in self.active_proxies
-            and (not record.anonymity or not record.country)
+            and (not record.anonymity or not record.country or not record.proxy_type)
         ]
         if not candidates:
             return
@@ -900,10 +1183,27 @@ class ProxyHarvester:
 
         sem_anon = asyncio.Semaphore(_ANONYMITY_ENRICH_CONCURRENCY)
         sem_geo = asyncio.Semaphore(_GEO_ENRICH_CONCURRENCY)
+        sem_geo_fast = asyncio.Semaphore(_GEO_FAST_CONCURRENCY)
+        type_budget = _TYPE_ENRICH_PER_CYCLE
+        type_lock = asyncio.Lock()
 
         async def enrich(record: ProxyRecord) -> None:
+            nonlocal type_budget
             proxy_url = record.proxy if "://" in record.proxy else f"http://{record.proxy}"
+            ip = _extract_ip(proxy_url)
             try:
+                # Country first: fast parallel provider (geojs.io — no key, no
+                # rate cap) so per-country coverage grows at full batch speed
+                # instead of waiting on ip-api.com's 45 req/min free tier.
+                if not record.country and ip:
+                    async with sem_geo_fast:
+                        country = await lookup_country_fast(
+                            self.session,  # type: ignore[arg-type]
+                            ip,
+                            5.0,
+                        )
+                    if country:
+                        record.country = country
                 if not record.anonymity:
                     async with sem_anon:
                         anon = await check_proxy_anonymity(
@@ -913,22 +1213,96 @@ class ProxyHarvester:
                         )
                         if anon:
                             record.anonymity = anon
-                if not record.country:
-                    ip = _extract_ip(proxy_url)
-                    async with sem_geo:
-                        await asyncio.sleep(_GEO_DELAY_SECONDS)
-                        country = await lookup_proxy_country(
-                            self.session,  # type: ignore[arg-type]
-                            ip,
-                            5.0,
-                        )
-                        if country:
-                            record.country = country
+                # Proxy-type classification stays on ip-api (the only provider
+                # with the hosting/mobile flags) but is budgeted per cycle to
+                # respect its free tier even with big verify batches.
+                if not record.proxy_type and ip:
+                    async with type_lock:
+                        allowed = type_budget > 0
+                        if allowed:
+                            type_budget -= 1
+                    if allowed:
+                        async with sem_geo:
+                            await asyncio.sleep(_GEO_DELAY_SECONDS)
+                            geo = await lookup_proxy_geo(
+                                self.session,  # type: ignore[arg-type]
+                                ip,
+                                5.0,
+                            )
+                        if geo:
+                            if not record.country and geo.get("country"):
+                                record.country = str(geo["country"])
+                            if not record.proxy_type and geo.get("proxy_type"):
+                                record.proxy_type = str(geo["proxy_type"])
             except Exception:
                 pass
 
         await asyncio.gather(*(enrich(record) for record in candidates))
 
+    async def _probe_platforms(self) -> None:
+        """Tag active proxies with the platforms they can actually reach.
+
+        Opt-in via ``config.platform_probes`` (e.g. "telegram,instagram,whatsapp").
+        Only proxies that passed basic verification are probed, through cheap
+        GET requests to tiny public endpoints (API root / robots.txt). Results
+        land in ``record.platforms`` and feed /proxies?platform=... .
+        """
+        wanted = [
+            name.strip().lower()
+            for name in (self.config.platform_probes or "").split(",")
+            if name.strip()
+        ]
+        wanted = [name for name in wanted if name in PLATFORM_PROBE_URLS]
+        if not wanted or not self.session:
+            return
+        now = time.monotonic()
+        candidates = [
+            record
+            for proxy, record in self.records.items()
+            if proxy in self.active_proxies
+            and (
+                not record.platforms
+                or (now - record.platforms_checked_at) >= _PLATFORM_REPROBE_SECONDS
+                or any(name not in record.platforms for name in wanted)
+            )
+        ]
+        if not candidates:
+            return
+        candidates = candidates[:_ENRICH_BATCH_SIZE]
+        sem = asyncio.Semaphore(_PLATFORM_PROBE_CONCURRENCY)
+        timeout = aiohttp.ClientTimeout(total=max(6.0, self.config.verify_timeout))
+
+        async def probe(record: ProxyRecord) -> None:
+            proxy_url = record.proxy if "://" in record.proxy else f"http://{record.proxy}"
+            stale = (now - record.platforms_checked_at) >= _PLATFORM_REPROBE_SECONDS
+            names = (
+                wanted
+                if stale or not record.platforms
+                else [name for name in wanted if name not in record.platforms]
+            )
+            results: Dict[str, bool] = {}
+            for name in names:
+                ok = False
+                try:
+                    async with sem:
+                        async with self.session.get(  # type: ignore[union-attr]
+                            PLATFORM_PROBE_URLS[name],
+                            proxy=proxy_url,
+                            timeout=timeout,
+                            headers={"User-Agent": DEFAULT_USER_AGENT},
+                            allow_redirects=True,
+                        ) as response:
+                            ok = 200 <= response.status < 400
+                except Exception:
+                    ok = False
+                results[name] = ok
+            if results:
+                record.platforms.update(results)
+                record.platforms_checked_at = time.monotonic()
+
+        await asyncio.gather(*(probe(record) for record in candidates))
+        tally = {n: sum(1 for r in candidates if r.platforms.get(n)) for n in wanted}
+        print(f"[platform-probe] candidates={len(candidates)} tally={tally}", flush=True)
     async def save_pool(self, force: bool = False) -> None:
         """Persist the active proxy pool to disk without blocking the event loop."""
         now = time.monotonic()
@@ -1002,6 +1376,95 @@ class ProxyHarvester:
         self.source_errors[url] = last_error
         return set()
 
+    def load_manual_proxies(self) -> Dict[str, Set[str]]:
+        """Read user-supplied proxies (e.g. paid residential) from a text file.
+
+        One entry per line: host:port, user:pass@host:port,
+        http://user:pass@host:port or socks5://user:pass@host:port.
+        An optional '|CC' suffix pins the ISO-2 exit country, e.g.
+        gate.provider.com:8080|SG — important for provider gateway hostnames
+        whose exit country geo lookup cannot guess (ip-api sees the gateway
+        IP, not the rotating exit). Lines starting with '#' are ignored;
+        inline '#' comments are stripped. These entries are always kept in the
+        pool, re-verified each cycle and tagged as residential.
+        """
+        entries: Dict[str, Set[str]] = {}
+        path = Path(self.config.residential_file)
+        if not path.exists():
+            return entries
+        label = f"manual:{path.name}"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return entries
+        for raw_line in text.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            country = ""
+            if "|" in line:
+                line, _, suffix = line.partition("|")
+                suffix = suffix.strip().upper()
+                if len(suffix) == 2 and suffix.isalpha():
+                    country = suffix
+                line = line.strip()
+            for chunk in re.split(r"[,\s;]+", line):
+                if not chunk:
+                    continue
+                normalized = normalize_manual_proxy(chunk)
+                if not normalized:
+                    continue
+                entries.setdefault(normalized, set()).add(label)
+                record = self.records.setdefault(
+                    normalized, ProxyRecord(proxy=normalized)
+                )
+                record.manual = True
+                if not record.proxy_type:
+                    record.proxy_type = "residential"
+                if country:
+                    record.country = country
+        return entries
+
+    def load_tor_proxies(self) -> Dict[str, Set[str]]:
+        """Read Tor SOCKS endpoints (written by Tor-manager.py) from a text file.
+
+        One entry per line: socks5://127.0.0.1:9701|US (the optional pipe +
+        ISO-2 suffix is the exit country that the Tor instance was started with
+        via ExitNodes {cc} + StrictNodes 1, so the record keeps that country
+        instead of relying on geo lookup). These endpoints are always kept,
+        re-verified every cycle and tagged proxy_type=tor.
+        """
+        entries: Dict[str, Set[str]] = {}
+        path = Path(self.config.tor_file)
+        if not path.exists():
+            return entries
+        label = f"tor:{path.name}"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return entries
+        for raw_line in text.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            country = ""
+            if "|" in line:
+                line, _, suffix = line.partition("|")
+                suffix = suffix.strip().upper()
+                if len(suffix) == 2 and suffix.isalpha():
+                    country = suffix
+                line = line.strip()
+            normalized = normalize_manual_proxy(line)
+            if not normalized:
+                continue
+            entries.setdefault(normalized, set()).add(label)
+            record = self.records.setdefault(normalized, ProxyRecord(proxy=normalized))
+            record.manual = True  # locally managed: always kept, verified first
+            record.proxy_type = "tor"
+            if country:
+                record.country = country
+        return entries
+
     async def collect_candidates(self) -> Dict[str, Set[str]]:
         candidate_sources: DefaultDict[str, Set[str]] = defaultdict(set)
         total_sources = len(self.sources)
@@ -1043,9 +1506,18 @@ class ProxyHarvester:
 
         await asyncio.gather(*(worker(url) for url in self.sources))
 
+        # Merge user-supplied proxies (paid residential etc.) and local Tor
+        # endpoints (Tor-manager.py) — always kept and verified first.
+        pinned: Dict[str, Set[str]] = {}
+        for mapping in (self.load_manual_proxies(), self.load_tor_proxies()):
+            for proxy, tags in mapping.items():
+                pinned.setdefault(proxy, set()).update(tags)
+                candidate_sources[proxy].update(tags)
+
         ranked = sorted(
             candidate_sources,
             key=lambda proxy: (
+                0 if self.records.get(proxy) and self.records[proxy].manual else 1,
                 -len(candidate_sources[proxy]),
                 -(
                     self.records[proxy].successful_checks
@@ -1064,6 +1536,27 @@ class ProxyHarvester:
             trimmed[proxy] = candidate_sources[proxy]
             record = self.records.setdefault(proxy, ProxyRecord(proxy=proxy))
             record.add_sources(candidate_sources[proxy])
+
+        # Never let the candidate cap drop user-supplied / managed proxies.
+        for proxy, tags in pinned.items():
+            if proxy not in trimmed:
+                trimmed[proxy] = tags
+                record = self.records.setdefault(proxy, ProxyRecord(proxy=proxy))
+                record.add_sources(tags)
+
+        # Country-targeted sources: pre-tag records with the list's country so
+        # per-country coverage grows immediately (geo enrichment only fills
+        # gaps for records from non-country sources).
+        if self.source_country:
+            for proxy, tags in trimmed.items():
+                record = self.records.get(proxy)
+                if record is None or record.country:
+                    continue
+                for url in tags:
+                    country_code = self.source_country.get(url)
+                    if country_code:
+                        record.country = country_code
+                        break
 
         self._emit_progress(
             phase="collect_complete",
@@ -1090,6 +1583,12 @@ class ProxyHarvester:
                 or self._needs_recheck(record)
             ):
                 batch.append(proxy)
+        # User-supplied proxies are verified first so they join the pool ASAP.
+        batch.sort(
+            key=lambda proxy: (
+                0 if self.records.get(proxy) and self.records[proxy].manual else 1
+            )
+        )
         return batch[: self.config.max_candidates]
 
     def _select_reverify_batch(self, exclude: Optional[Set[str]] = None) -> List[str]:
@@ -1173,7 +1672,7 @@ class ProxyHarvester:
         remove: List[str] = []
 
         for proxy, record in self.records.items():
-            if proxy in self.active_proxies:
+            if proxy in self.active_proxies or record.manual:
                 continue
             age = (utc_now() - record.last_checked).total_seconds()
             # M-1: Require at least 5 checks before permanently pruning a proxy.
@@ -1193,7 +1692,7 @@ class ProxyHarvester:
             inactive = [
                 (proxy, record)
                 for proxy, record in self.records.items()
-                if proxy not in self.active_proxies
+                if proxy not in self.active_proxies and not record.manual
             ]
             inactive.sort(
                 key=lambda x: (
@@ -1232,7 +1731,17 @@ class ProxyHarvester:
             summary["collected_candidates"] = len(candidates)
             batch = self._select_collect_batch(candidates)
             if batch:
-                outcomes = await self.verify_proxies(batch)
+                # Verify in chunks and publish the pool after every chunk so a
+                # fresh start becomes usable within minutes instead of waiting
+                # for the whole (up to max_candidates) initial verification.
+                chunk_size = max(1, self.config.verify_batch_size)
+                outcomes: List[ProbeOutcome] = []
+                for start in range(0, len(batch), chunk_size):
+                    chunk = batch[start : start + chunk_size]
+                    outcomes.extend(await self.verify_proxies(chunk))
+                    self._prune_records()
+                    self._rebuild_active_proxies()
+                    await self.save_pool()
                 summary["verified_proxies"] += len(outcomes)
                 verified_now.update(outcome.proxy for outcome in outcomes)
             self._last_collect = time.monotonic()
@@ -1249,6 +1758,7 @@ class ProxyHarvester:
         self._prune_records()
         self._rebuild_active_proxies()
         await self._enrich_pool()
+        await self._probe_platforms()
         summary["active_proxies"] = len(self.active_proxies)
         summary["added_active"] = len(self.active_proxies - previous_active)
         summary["removed_active"] = len(previous_active - self.active_proxies)

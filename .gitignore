@@ -1,0 +1,21 @@
+# Secrets & local runtime state — never commit these
+proxy-service-config.env
+residential-proxies.txt
+akamai-cookies.json
+output/
+state/
+
+# Tor bundles (large, local-only)
+tor/
+tor-data/
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
