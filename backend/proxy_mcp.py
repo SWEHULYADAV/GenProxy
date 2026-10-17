@@ -18,7 +18,7 @@ Run directly (stdio transport):
     venv\\Scripts\\python.exe proxy_mcp.py
 
 Install deps first:
-    venv\\Scripts\\pip install -r requirements-mcp.txt
+    venv\\Scripts\\pip install -r requirements.txt
 """
 from __future__ import annotations
 
@@ -36,7 +36,11 @@ from typing import Any, Dict, Optional
 import aiohttp
 from mcp.server import MCPServer
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = (
+    Path(__file__).resolve().parent.parent
+    if Path(__file__).resolve().parent.name == "backend"
+    else Path(__file__).resolve().parent
+)
 CONFIG_FILE = PROJECT_DIR / "proxy-service-config.env"
 OUTPUT_DIR = PROJECT_DIR / "output"
 PID_FILE = OUTPUT_DIR / ".proxy_service.pid"
@@ -435,7 +439,10 @@ async def proxy_service_start(warmup: bool = False, wait_seconds: float = 60.0) 
         })
 
     python = _find_venv_python() or Path(sys.executable)
-    cmd = [str(python), str(PROJECT_DIR / "Proxy-api.py")]
+    app_entry = PROJECT_DIR / "app.py"
+    if not app_entry.exists():
+        app_entry = PROJECT_DIR / "backend" / "Proxy-api.py"
+    cmd = [str(python), str(app_entry)]
     if warmup:
         cmd.append("--warmup")
 

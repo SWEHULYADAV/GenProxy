@@ -9,15 +9,20 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+BACKEND = ROOT / "backend"
+for p in (str(BACKEND), str(ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 
 def _load_api():
     """Proxy-api.py has a hyphen in its name, so it cannot be imported with a plain `import`."""
     if "proxy_api" in sys.modules:
         return sys.modules["proxy_api"]
-    spec = importlib.util.spec_from_file_location("proxy_api", ROOT / "Proxy-api.py")
+    api_path = BACKEND / "Proxy-api.py"
+    if not api_path.exists():
+        api_path = ROOT / "Proxy-api.py"
+    spec = importlib.util.spec_from_file_location("proxy_api", api_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["proxy_api"] = module
     spec.loader.exec_module(module)

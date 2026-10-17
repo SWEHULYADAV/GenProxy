@@ -68,7 +68,7 @@ exit /b 1
 title Proxy Generator Live
 echo Starting live proxy window...
 echo.
-venv\Scripts\python.exe -u Live-proxies.py --output-root "%~dp0output" !FORWARD_ARGS!
+venv\Scripts\python.exe -u app.py live --output-root "%~dp0output" !FORWARD_ARGS!
 echo.
 echo Live proxy session ended.
 pause
@@ -93,7 +93,7 @@ set "API_ARGS=!API_ARGS! --warmup"
 :skip_warmup
 if /I "%PROXY_SERVICE_LOG_REQUESTS%"=="1" set "API_ARGS=!API_ARGS! --log-requests"
 
-venv\Scripts\python.exe -u Proxy-api.py !API_ARGS! !FORWARD_ARGS!
+venv\Scripts\python.exe -u app.py api !API_ARGS! !FORWARD_ARGS!
 echo.
 echo Proxy API stopped.
 pause

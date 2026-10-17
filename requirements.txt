@@ -1,16 +1,23 @@
-# Core packages — install with:
-#   venv\Scripts\pip install -r requirements.txt
+# ==========================================
+# Proxy Generation & Multi-Route Service
+# ==========================================
 
+# Core Dependencies (Proxy Engine & API Service)
 aiohttp
 aiohttp-socks
 python-socks
 requests
 rich
-curl_cffi           # Chrome TLS-fingerprint HTTP client (direct_fetch.py + hard targets)
+curl_cffi
 
-# Optional browser-helper packages live in requirements-browser.txt (NOT needed for the API service):
-#   venv\Scripts\pip install -r requirements-browser.txt
-#   venv\Scripts\pip install nodriver          # stealth_browser.py — best stealth (direct / own-IP only)
-#   venv\Scripts\python -m cloakbrowser install
-#   venv\Scripts\python -m camoufox fetch
-#   venv\Scripts\playwright install chromium
+# Browser & Stealth Automation (Optional - for stealth_browser.py & akamai_warm.py)
+nodriver
+cloakbrowser[geoip]
+camoufox[geoip]
+playwright
+
+# Testing & Development
+pytest
+
+# Model Context Protocol / AI Integration (Optional - for proxy_mcp.py)
+mcp

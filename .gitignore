@@ -14,8 +14,13 @@ venv/
 __pycache__/
 *.py[cod]
 
+# Tor runtime output
+tor-proxies.txt
+
 # Editors / OS
+opencode.json
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+

@@ -55,8 +55,12 @@ try:
     _CURL_OK = True
 except ImportError:
     _CURL_OK = False
-
-COOKIE_FILE = Path(__file__).resolve().parent / "akamai-cookies.json"
+_PROJECT_DIR = (
+    Path(__file__).resolve().parent.parent
+    if Path(__file__).resolve().parent.name == "backend"
+    else Path(__file__).resolve().parent
+)
+COOKIE_FILE = _PROJECT_DIR / "akamai-cookies.json"
 FALLBACK_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

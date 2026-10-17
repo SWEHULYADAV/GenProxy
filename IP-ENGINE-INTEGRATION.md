@@ -1,7 +1,6 @@
 # Engine Integration Guide — Proxy Generator as a scoped proxy source
 
-Last updated: 2026-10-17. Companion docs: `RESEARCH-2026-10-17.md` (full
-detection map + measured results), `ROADMAP.md` (what is and is not built).
+Last updated: 2026-10-17. Companion docs: `ROADMAP.md` (what is and is not built).
 
 This page answers the review that said this folder "should not be the main
 proxy source" for the engine. **The review is right about the global-proxy
@@ -141,7 +140,7 @@ curl.exe -X POST http://127.0.0.1:1712/fetch -H "X-API-Key: KEY" -H "Content-Typ
 ```
 
 Endpoints can change without notice — keep a cheap sanity check (status 200 +
-body length) in the job. Full evidence: `RESEARCH-2026-10-17.md` §2.5.
+body length) in the job.
 
 ## Verdict semantics (avoid false "Down")
 
@@ -169,10 +168,10 @@ since 2026-10-17.
 
 ## Security & hygiene
 
-- **Free "residential" proxies are hijacked devices** — FBI (AVrecon/SocksEscort,
+- **Free "residential" proxies are frequently hijacked devices** — FBI (AVrecon/SocksEscort,
   ~369k routers sold as residential proxies), Google (IPIDEA SDKs), BitSight
   (~15% active malware, ~50% for IPIDEA), NDSS (16,923 content-manipulating
-  proxies). Full report: `HIJACKED-PROXY-RESEARCH.md`. Never route logins,
+  proxies). Never route logins,
   cookies, tokens or API keys through free proxies.
 - `proxy-service-config.env` (API key + tunnel key) and
   `residential-proxies.txt` (provider credentials) are **gitignored**.

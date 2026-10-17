@@ -36,7 +36,11 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = (
+    Path(__file__).resolve().parent.parent
+    if Path(__file__).resolve().parent.name == "backend"
+    else Path(__file__).resolve().parent
+)
 TOR_ROOT = PROJECT_DIR / "tor"
 TOR_DATA = PROJECT_DIR / "tor-data"
 PROXIES_FILE = PROJECT_DIR / "tor-proxies.txt"

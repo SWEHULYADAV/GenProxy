@@ -44,16 +44,19 @@ Main local endpoints:
 
 Main files:
 
-- [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Proxy-api.py>) - local API service and HTTP proxy tunnel
-- [proxy_core.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_core.py>) - source collection, validation, scoring, active pool logic
-- [Live-proxies.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Live-proxies.py>) - live proxy monitor window
-- [Start-Live-Proxies.bat](</c:/Users/Admin/Desktop/Proxy_Generation-main/Start-Live-Proxies.bat>) - one-click launcher
-- [stealth_browser.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/stealth_browser.py>) - optional browser helper
-- [proxy_mcp.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_mcp.py>) - MCP server so AI agents (OpenCode, Claude Desktop, Cursor) can operate the service
-- [requirements.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/requirements.txt>) - Python dependencies for the project
-- [requirements-mcp.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/requirements-mcp.txt>) - optional dependency for proxy_mcp.py
-- [ROADMAP.md](</c:/Users/Admin/Desktop/Proxy_Generation-main/ROADMAP.md>) - roadmap and gap analysis vs premium providers
-- [residential-proxies.txt](</c:/Users/Admin/Desktop/Proxy_Generation-main/residential-proxies.txt>) - your own (paid) residential proxies, one per line
+- [app.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/app.py) - single root application entry point (`python app.py [api|live|harvest|mcp]`)
+- [backend/](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/) - all backend modules & engine files:
+  - [backend/Proxy-api.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Proxy-api.py) - local API service & HTTP proxy tunnel
+  - [backend/proxy_core.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/proxy_core.py) - source collection, validation, scoring, active pool logic
+  - [backend/Live-proxies.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Live-proxies.py) - live proxy monitor window
+  - [backend/proxy_mcp.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/proxy_mcp.py) - MCP server for AI agent operations
+  - [backend/stealth_browser.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/stealth_browser.py) - stealth browser automation helper
+  - [backend/direct_fetch.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/direct_fetch.py) - direct fetch client with Chrome TLS print
+  - [backend/Tor-manager.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Tor-manager.py) - multi-instance local Tor manager
+- [Start-Live-Proxies.bat](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/Start-Live-Proxies.bat) - one-click launcher (runs via app.py)
+- [requirements.txt](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/requirements.txt) - all consolidated Python dependencies
+- [ROADMAP.md](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/ROADMAP.md) - roadmap and gap analysis vs premium providers
+- [residential-proxies.txt](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/residential-proxies.txt) - your own (paid) residential proxies, one per line
 
 ## What This Project Really Is
 
@@ -181,14 +184,15 @@ Requires Python 3.11 or newer.
 
 ### 3. Install Python dependencies
 
+All dependencies (core, stealth browser, dev, and MCP) are consolidated into a single `requirements.txt`:
+
 ```bat
 venv\Scripts\pip install -r requirements.txt
 ```
 
-If you want the optional browser helper to work fully, also run:
+If you use the optional browser engines:
 
 ```bat
-venv\Scripts\pip install -r requirements-browser.txt
 venv\Scripts\python -m cloakbrowser install
 venv\Scripts\python -m camoufox fetch
 venv\Scripts\playwright install chromium
@@ -1000,10 +1004,10 @@ http://127.0.0.1:1909
 (OpenCode, Claude Desktop, Cursor, ...) can check the pool, start/stop the service, and fetch
 targets through the rotating proxies.
 
-Install the extra dependency:
+Install dependencies:
 
 ```bat
-venv\Scripts\pip install -r requirements-mcp.txt
+venv\Scripts\pip install -r requirements.txt
 ```
 
 ### OpenCode
@@ -1214,7 +1218,7 @@ venv\Scripts\python direct_fetch.py URL --proxy http://user:pass@host:port
 Notes:
 - Public https targets only; keep polite pacing (`--delay`) — your IP is the budget.
 - Akamai JS-sensor sites (Meesho, Ajio) and DataDome (Etsy US locale) still need
-  the browser helper or residential; `RESEARCH-2026-10-17.md` has the full map.
+  the browser helper or residential proxies.
 
 ## Fetch Routing: pool / direct / unlock
 

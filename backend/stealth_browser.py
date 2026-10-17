@@ -78,8 +78,12 @@ DEFAULT_PROXY = "http://127.0.0.1:1909"
 # ---------------------------------------------------------------------------
 #  Proxy URL handling (tunnel credentials are auto-injected from the local
 #  service env file when the proxy points at the local tunnel without auth).
-# ---------------------------------------------------------------------------
-_TUNNEL_ENV_FILE = Path(__file__).resolve().parent / "proxy-service-config.env"
+_PROJECT_DIR = (
+    Path(__file__).resolve().parent.parent
+    if Path(__file__).resolve().parent.name == "backend"
+    else Path(__file__).resolve().parent
+)
+_TUNNEL_ENV_FILE = _PROJECT_DIR / "proxy-service-config.env"
 
 
 def _load_service_env() -> Dict[str, str]:
@@ -999,7 +1003,7 @@ async def scrape_url(
     else:
         failure_message = (
             "No browser engine available. Install one:\n"
-            "  pip install -r requirements-browser.txt\n"
+            "  pip install -r requirements.txt\n"
             "  pip install nodriver\n"
             "  python -m cloakbrowser install\n"
             "  python -m camoufox fetch\n"
@@ -1065,9 +1069,9 @@ def _print_engine_status() -> None:
     print("Engine status:")
     print(f"  nodriver   : {'[OK] available' if _NODRIVER_OK else '[--] not installed  (pip install nodriver)'}"
           f"{'  [direct-only: no proxy auth]' if _NODRIVER_OK else ''}")
-    print(f"  cloakbrowser: {'[OK] available' if _CLOAK_OK else '[--] not installed  (pip install -r requirements-browser.txt && python -m cloakbrowser install)'}")
-    print(f"  camoufox  : {'[OK] available' if _CAMOUFOX_OK  else '[--] not installed  (pip install -r requirements-browser.txt && python -m camoufox fetch)'}")
-    print(f"  playwright: {'[OK] available' if _PLAYWRIGHT_OK else '[--] not installed  (pip install -r requirements-browser.txt && playwright install chromium)'}")
+    print(f"  cloakbrowser: {'[OK] available' if _CLOAK_OK else '[--] not installed  (pip install -r requirements.txt && python -m cloakbrowser install)'}")
+    print(f"  camoufox  : {'[OK] available' if _CAMOUFOX_OK  else '[--] not installed  (pip install -r requirements.txt && python -m camoufox fetch)'}")
+    print(f"  playwright: {'[OK] available' if _PLAYWRIGHT_OK else '[--] not installed  (pip install -r requirements.txt && playwright install chromium)'}")
 
 
 def _run_async(coro):

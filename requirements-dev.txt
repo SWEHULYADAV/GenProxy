@@ -1,6 +1,0 @@
-# Test dependencies — install with:
-#   venv\Scripts\pip install -r requirements-dev.txt
-# Run the (offline) suite with:
-#   venv\Scripts\python -m pytest
--r requirements.txt
-pytest
