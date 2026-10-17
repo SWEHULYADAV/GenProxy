@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import signal
 import socket
@@ -14,6 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import (
     Any,
     Callable,
@@ -24,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
 )
 
 import aiohttp
@@ -36,127 +39,90 @@ except ImportError:
 
 DEFAULT_OUTPUT_FILE = "active_proxies.json"
 DEFAULT_USER_AGENT = "ProxyGenerator/2.0 (+local pool manager)"
+# Probe endpoints that echo the caller's IP (JSON or plain text). Each one must
+# return an IP: a probe URL that never yields an origin can only ever fail.
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
     "https://httpbin.org/ip",
-    "https://example.com/",
-)
-DEFAULT_SOURCES = (
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all.txt",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/theriturajps/proxy-list/main/proxies.txt",
-    "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/http.txt",
-    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
-    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
-    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
-    "https://raw.githubusercontent.com/gitrecon1455/fresh-proxy-list/main/all.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/https.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/http.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
-    "https://api.proxyscrape.com/v2/?request=get&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://api.openproxylist.xyz/http.txt",
-    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/mertguvencli/http-proxy-list/main/proxy-list/data.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://raw.githubusercontent.com/shiftytr/proxy-list/master/proxy.txt",
-    "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
-    # --- Additional HTTP sources ---
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
-    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
-    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
-    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
-    "https://raw.githubusercontent.com/rxvl-d/ProxyList/main/results.txt",
-    "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/http.txt",
-    # --- Fresh/high-update sources (every 5-30 min) ---
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
-    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
-    "https://raw.githubusercontent.com/rx443/proxy-list/online/online/http.txt",
-    "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/http.txt",
-    "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
-    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
-    "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/http.txt",
-    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
-    "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/https.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
-    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/https.txt",
-    # --- ProxyScrape API (multiple protocols) ---
-    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all&anonymity=all",
-    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000",
-    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4&timeout=10000",
-    # --- SOCKS5 sources ---
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
-    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
-    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks5.txt",
-    # --- SOCKS4 sources ---
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
-    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
-    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
-    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
-    # --- APIs that return JSON (regex still extracts IP:port) ---
-    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=http",
-    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=socks5",
-    # --- Curated fresh high-yield feeds (2026 update) ---
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
-    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
-    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks4_proxies.txt",
-    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
-    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
-    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
-    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
-    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
-    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
-    "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/unchecked.txt",
-    "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
-    "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
-    "https://raw.githubusercontent.com/im-razvan/proxy_list/main/socks5.txt",
-    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
-    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
-    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
-    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
-    "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks5.txt",
-    "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks4.txt",
-    "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks5.txt",
+    "https://icanhazip.com/",
 )
 
 # ---------------------------------------------------------------------------
-# Country-targeted free proxy lists ({cc} = lower ISO-2, {CC} = upper ISO-2).
-# Every fetched record from these sources is pre-tagged with the list country,
-# so per-country coverage grows even before geo enrichment has seen it.
+# Source lists live in proxy-sources.txt (project root), so a dead or moved
+# list is fixed by editing that file instead of this module.
+# PROXY_SERVICE_SOURCES_FILE points at a different file. A URL containing
+# {cc} / {CC} is a country template (lower / upper ISO-2); every record it
+# returns is pre-tagged with that country, so per-country coverage grows even
+# before geo enrichment has seen it.
 # ---------------------------------------------------------------------------
-COUNTRY_SOURCE_TEMPLATES = (
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&country={cc}&proxy_format=protocolipport&format=text",
+SOURCES_FILE_NAME = "proxy-sources.txt"
+_COUNTRY_PLACEHOLDERS = ("{cc}", "{CC}")
+
+# Used only when proxy-sources.txt is missing or empty, so the pool still fills.
+_FALLBACK_SOURCES = (
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+)
+_FALLBACK_COUNTRY_TEMPLATES = (
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/{CC}/data.txt",
 )
+
+
+def default_sources_path() -> Path:
+    override = os.environ.get("PROXY_SERVICE_SOURCES_FILE", "").strip()
+    if override:
+        return Path(override)
+    here = Path(__file__).resolve().parent
+    for candidate in (here.parent / SOURCES_FILE_NAME, here / SOURCES_FILE_NAME):
+        if candidate.exists():
+            return candidate
+    return here.parent / SOURCES_FILE_NAME
+
+
+def parse_sources_text(text: str) -> Tuple[List[str], List[str]]:
+    """Split a proxy-sources.txt body into (list URLs, country templates).
+
+    Blank lines and lines starting with '#' are skipped; anything after the
+    URL on the same line (a note) is ignored.
+    """
+    sources: List[str] = []
+    templates: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        url = stripped.split()[0]
+        target = templates if any(p in url for p in _COUNTRY_PLACEHOLDERS) else sources
+        if url not in target:
+            target.append(url)
+    return sources, templates
+
+
+def load_sources_file(path: str | Path | None = None) -> Tuple[List[str], List[str]]:
+    file_path = Path(path) if path else default_sources_path()
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except OSError:
+        return [], []
+    return parse_sources_text(text)
+
+
+def _load_default_sources() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    sources, templates = load_sources_file()
+    if not sources and not templates:
+        print(
+            f"[sources] {default_sources_path()} is missing or empty - "
+            "using the built-in fallback lists",
+            file=sys.stderr,
+        )
+        return _FALLBACK_SOURCES, _FALLBACK_COUNTRY_TEMPLATES
+    return tuple(sources), tuple(templates)
+
+
+DEFAULT_SOURCES, COUNTRY_SOURCE_TEMPLATES = _load_default_sources()
 
 # Countries queried by default (ISO-2, lowercase).
 DEFAULT_COUNTRY_SOURCE_CODES = (
@@ -194,7 +160,7 @@ ANONYMOUS_LEAK_HEADERS = {
     "via", "proxy-connection", "x-proxy-id", "x-forwarded-host", "x-forwarded-server",
 }
 GEO_API_URL = (
-    "http://ip-api.com/json/{ip}?fields=status,countryCode,hosting,mobile,isp"
+    "http://ip-api.com/json/{ip}?fields=status,countryCode,hosting,mobile,isp,org,as,asname"
 )
 _GEO_ENRICH_CONCURRENCY = 1
 _GEO_DELAY_SECONDS = 1.4  # ~42 req/min to stay below ip-api.com free limits
@@ -274,12 +240,12 @@ def is_safe_proxy_host(host: str) -> bool:
     return True
 
 
-def normalize_proxy(candidate: str) -> Optional[str]:
+def normalize_proxy(candidate: str, default_protocol: str = "http") -> Optional[str]:
     value = candidate.strip()
     if not value:
         return None
 
-    protocol = "http"
+    protocol = default_protocol
     if "://" in value:
         scheme, rest = value.split("://", 1)
         scheme = scheme.lower()
@@ -469,24 +435,112 @@ def parse_datetime(value: str | None) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def extract_proxies(text: str) -> Set[str]:
-    proxies: Set[str] = set()
+_SOCKS_URL_MARKERS = (("socks5", "socks5"), ("socks4", "socks4"))
+
+
+def source_protocol_hint(url: str) -> str:
+    """Protocol implied by a list URL: …/socks5.txt, protocol=socks4, SOCKS5_RAW.txt.
+
+    Bare "ip:port" lines carry no scheme, so a SOCKS list read without this
+    hint is probed as HTTP and almost every entry fails. The file name and
+    query win over the rest of the path (hookzof/socks5_list/…/proxy.txt is
+    still SOCKS5, …/http/…/socks5_checked.txt is SOCKS5).
+    """
+    try:
+        parts = urlsplit(url.lower())
+    except ValueError:
+        return "http"
+    tail = parts.path.rsplit("/", 1)[-1] + "?" + parts.query
+    for marker, protocol in _SOCKS_URL_MARKERS:
+        if marker in tail:
+            return protocol
+    if "http" in tail:
+        return "http"
+    for marker, protocol in _SOCKS_URL_MARKERS:
+        if marker in parts.path:
+            return protocol
+    return "http"
+
+
+_JSON_PROTOCOLS = {
+    "http": "http", "https": "http",
+    "socks4": "socks4", "socks4a": "socks4",
+    "socks5": "socks5", "socks5h": "socks5",
+}
+
+
+def _json_proxy_entries(payload: Any, default_protocol: str, depth: int = 0):
+    """Yield (raw proxy, ISO-2 country or '') from JSON APIs such as geonode.
+
+    Those return {"ip": ..., "port": ..., "protocols": [...], "country": ...}
+    objects, which the ip:port regex never matches.
+    """
+    if depth > 6:
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            yield from _json_proxy_entries(item, default_protocol, depth + 1)
+        return
+    if not isinstance(payload, dict):
+        return
+    ip = payload.get("ip") or payload.get("ipAddress") or payload.get("host")
+    port = payload.get("port")
+    if isinstance(ip, str) and isinstance(port, (str, int)) and str(port).isdigit():
+        raw = payload.get("protocols") or payload.get("protocol") or payload.get("type")
+        names = raw if isinstance(raw, list) else [raw] if isinstance(raw, str) else []
+        protocols = {
+            _JSON_PROTOCOLS[name.lower()]
+            for name in names
+            if isinstance(name, str) and name.lower() in _JSON_PROTOCOLS
+        }
+        country = (
+            payload.get("country") or payload.get("countryCode") or payload.get("country_code") or ""
+        )
+        if not (isinstance(country, str) and len(country) == 2 and country.isalpha()):
+            country = ""
+        for protocol in sorted(protocols or {default_protocol}):
+            yield f"{protocol}://{ip.strip()}:{int(port)}", country.upper()
+        return
+    for value in payload.values():
+        if isinstance(value, (list, dict)):
+            yield from _json_proxy_entries(value, default_protocol, depth + 1)
+
+
+def extract_proxies_with_hints(text: str, default_protocol: str = "http") -> Dict[str, str]:
+    """Return {normalized proxy: ISO-2 country hint or ''} found in a list body.
+
+    ``default_protocol`` applies to bare "ip:port" entries (see
+    source_protocol_hint); entries with their own scheme keep it.
+    """
+    proxies: Dict[str, str] = {}
     auth_hosts: Set[str] = set()
     scheme_hosts: Set[str] = set()
+
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+        for raw_proxy, country in _json_proxy_entries(payload, default_protocol):
+            normalized = normalize_proxy(raw_proxy)
+            if normalized:
+                proxies[normalized] = country
+                scheme_hosts.add(normalized.rsplit("://", 1)[1])
 
     # Scheme-aware pass first: keeps socks5/socks4 protocol info that would
     # otherwise be lost (a socks5 endpoint probed as http always fails).
     for raw_proxy in PROXY_WITH_SCHEME_PATTERN.findall(text):
         normalized = normalize_proxy(raw_proxy)
         if normalized:
-            proxies.add(normalized)
+            proxies.setdefault(normalized, "")
             if "://" in normalized:
                 scheme_hosts.add(normalized.rsplit("://", 1)[1])
 
     for raw_proxy in PROXY_WITH_AUTH_PATTERN.findall(text):
-        normalized = normalize_proxy(raw_proxy)
+        normalized = normalize_proxy(raw_proxy, default_protocol)
         if normalized:
-            proxies.add(normalized)
+            proxies.setdefault(normalized, "")
             auth_hosts.add(normalized.rsplit("@", 1)[1])
 
     for raw_proxy in PROXY_PATTERN.findall(text):
@@ -494,11 +548,15 @@ def extract_proxies(text: str) -> Set[str]:
             # Same endpoint already extracted with credentials / scheme — skip
             # the duplicate (it would just fail verification).
             continue
-        normalized = normalize_proxy(raw_proxy)
+        normalized = normalize_proxy(raw_proxy, default_protocol)
         if normalized:
-            proxies.add(normalized)
+            proxies.setdefault(normalized, "")
 
     return proxies
+
+
+def extract_proxies(text: str, default_protocol: str = "http") -> Set[str]:
+    return set(extract_proxies_with_hints(text, default_protocol))
 
 
 def read_source_file(path: str | None) -> List[str]:
@@ -529,10 +587,24 @@ def _extract_origin(body: str) -> str:
     except json.JSONDecodeError:
         pass
 
+    # Plain-text echo services answer with just the IP. A longer body is a
+    # portal / login / ad page that some broken "proxies" return for every
+    # URL; an IP somewhere inside it (often 192.168.x.x) is not an origin.
+    if len(stripped) > 64:
+        return ""
     ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", stripped)
     if ip_match:
         return ip_match.group(0)
     return ""
+
+
+def _origin_is_public(origin: str) -> bool:
+    """True when the echoed origin starts with a public IP (httpbin may list a chain)."""
+    first = origin.split(",", 1)[0].strip()
+    try:
+        return ipaddress.ip_address(first).is_global
+    except ValueError:
+        return False
 
 
 def _extract_ip(proxy_url: str) -> str:
@@ -618,11 +690,36 @@ async def check_proxy_anonymity(
     return ""
 
 
+# ip-api's "hosting" flag misses many smaller hosting / cloud / transit
+# networks (e.g. CtrlS, Zenlayer, backbone carriers), and anything it does not
+# flag would otherwise be labelled residential. Their ISP / org / AS names give
+# them away. Keep entries specific: "google" alone would catch Google Fiber,
+# "colo" alone would catch Colombian ISPs.
+_DATACENTER_NAME_HINTS = (
+    "hosting", "hostinger", "cloud", "datacenter", "data center", "data centre",
+    "data services", "server", "vps", "colocation", "backbone", "dedicated", "cdn",
+    "amazon", "google llc", "google cloud", "microsoft", "azure", "oracle",
+    "digitalocean", "ovh", "hetzner", "linode", "akamai", "vultr", "choopa",
+    "contabo", "leaseweb", "m247", "datacamp", "zenlayer", "ctrls", "alibaba",
+    "tencent", "scaleway", "ionos", "godaddy", "fastly", "psychz", "quadranet",
+    "colocrossing", "hivelocity", "gcore", "g-core", "upcloud", "kamatera",
+    "racknerd", "frantech", "ponynet", "netcup", "aeza", "stark industries",
+    "selectel", "timeweb", "hostkey", "worldstream", "tzulo",
+)
+
+
+def _looks_like_datacenter(geo: Dict[str, Any]) -> bool:
+    names = " ".join(
+        str(geo.get(key) or "") for key in ("isp", "org", "as", "asname")
+    ).lower()
+    return any(hint in names for hint in _DATACENTER_NAME_HINTS)
+
+
 def _classify_proxy_type(geo: Dict[str, Any]) -> str:
     """Map ip-api.com geo data to a proxy type label."""
     if geo.get("mobile"):
         return "mobile"
-    if geo.get("hosting"):
+    if geo.get("hosting") or _looks_like_datacenter(geo):
         return "datacenter"
     return "residential"
 
@@ -663,7 +760,7 @@ async def lookup_proxy_geo_batch(
     if not ips:
         return {}
     results: Dict[str, Dict[str, Any]] = {}
-    batch_url = "http://ip-api.com/batch?fields=status,countryCode,hosting,mobile,isp,query"
+    batch_url = "http://ip-api.com/batch?fields=status,countryCode,hosting,mobile,isp,org,as,asname,query"
     # Process unique IPs in chunks of 100
     unique_ips = list(dict.fromkeys(ip.strip() for ip in ips if ip.strip()))
     for i in range(0, len(unique_ips), 100):
@@ -762,6 +859,19 @@ class HarvesterConfig:
     country_source_codes: str = "default"
     platform_probes: str = ""  # e.g. "telegram,instagram,whatsapp" ("" = disabled)
     test_urls: List[str] = field(default_factory=lambda: list(DEFAULT_TEST_URLS))
+    # A pool saved by an earlier run (e.g. the previous API session). Loaded
+    # when output_file does not exist yet, so a restart starts from proxies
+    # that were working minutes ago instead of an empty pool.
+    seed_file: str = ""
+    # Free lists hold far more entries than one cycle can verify. A candidate
+    # that has never worked is retried after retry_backoff_seconds, doubling
+    # per failure up to max_retry_backoff_seconds, so every cycle spends its
+    # max_candidates budget on entries that were not just seen dead.
+    retry_backoff_seconds: float = 900.0
+    max_retry_backoff_seconds: float = 6 * 3600.0
+    # Country-template lists (hundreds of URLs) change slowly; re-fetching them
+    # every cycle only gets the source host to rate-limit us.
+    country_source_refresh: float = 1800.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1097,6 +1207,7 @@ class ProbeOutcome:
     error: str = ""
     origin: str = ""
     status_code: int = 0
+    timed_out: bool = False  # gave up on a timeout (slow / blackholed), not a refusal
 
 
 async def _probe_socks_proxy(
@@ -1110,8 +1221,11 @@ async def _probe_socks_proxy(
         return ProbeOutcome(proxy=proxy, working=False, error="aiohttp_socks not installed")
     headers = {"User-Agent": user_agent, "Accept": "application/json,text/plain,*/*"}
     errors: List[str] = []
+    timed_out = False
     try:
-        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url, ssl=False)
+        # Certificates are verified like on the HTTP path, so a SOCKS hop that
+        # intercepts HTTPS fails here instead of joining the pool.
+        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url)
         async with aiohttp.ClientSession(connector=connector, trust_env=False) as socks_session:
             for test_url in test_urls:
                 started = time.perf_counter()
@@ -1125,7 +1239,7 @@ async def _probe_socks_proxy(
                             errors.append(f"{response.status} from {test_url}")
                             continue
                         origin = _extract_origin(body)
-                        if not origin:
+                        if not origin or not _origin_is_public(origin):
                             errors.append(f"no origin from {test_url}")
                             continue
                         return ProbeOutcome(
@@ -1135,6 +1249,8 @@ async def _probe_socks_proxy(
                         )
                 except asyncio.TimeoutError:
                     errors.append(f"timeout from {test_url}")
+                    timed_out = True
+                    break  # a hop this slow will not pass the next URL either
                 except Exception as exc:
                     errors.append(f"{exc.__class__.__name__} from {test_url}")
     except Exception as exc:
@@ -1142,12 +1258,20 @@ async def _probe_socks_proxy(
     return ProbeOutcome(
         proxy=proxy, working=False,
         error="; ".join(errors[:3]) if errors else "unknown error",
+        timed_out=timed_out,
     )
 
 
 async def tcp_preflight_check(host: str, port: int, timeout: float = 1.8) -> bool:
     """Pre-flight check: ensure remote TCP port responds with SYN-ACK within timeout."""
-    if not is_safe_proxy_host(host) and not host.startswith("100.") and not (host == "127.0.0.1" and 9000 <= port <= 9999):
+    # Hostnames only come from the user's own residential file (free lists are
+    # IPv4-only), and normalize_manual_proxy already screened those.
+    if (
+        _IPV4_PATTERN.match(host)
+        and not is_safe_proxy_host(host)
+        and not host.startswith("100.")
+        and not (host == "127.0.0.1" and 9000 <= port <= 9999)
+    ):
         return False
     try:
         reader, writer = await asyncio.wait_for(
@@ -1175,6 +1299,8 @@ async def probe_proxy(
     proxy_url = proxy if "://" in proxy else f"http://{proxy}"
     errors: List[str] = []
     clean_addr = proxy.split("://", 1)[-1].split("@", 1)[-1]
+    # Protocol auto-detection drops credentials, so it only runs for open proxies.
+    has_auth = "@" in proxy.split("://", 1)[-1]
     if ":" in clean_addr:
         h, p_str = clean_addr.rsplit(":", 1)
         try:
@@ -1191,8 +1317,19 @@ async def probe_proxy(
             pass
 
     if proxy_url.startswith(("socks4://", "socks5://")):
-        return await _probe_socks_proxy(proxy, proxy_url, test_urls, timeout_seconds, user_agent)
+        outcome = await _probe_socks_proxy(proxy, proxy_url, test_urls, timeout_seconds, user_agent)
+        if outcome.working or outcome.timed_out or has_auth or not _SOCKS_OK:
+            return outcome
+        # SOCKS lists mix versions: a fast refusal is often just the other one.
+        other = "socks4" if proxy_url.startswith("socks5://") else "socks5"
+        alt_url = f"{other}://{clean_addr}"
+        alt = await _probe_socks_proxy(
+            alt_url, alt_url, test_urls[:1], min(timeout_seconds, 6.0), user_agent
+        )
+        return alt if alt.working else outcome
 
+    spoke_http = False  # the far end answered in HTTP, so it is not a SOCKS server
+    timed_out = False
     for test_url in test_urls:
         started = time.perf_counter()
         try:
@@ -1204,12 +1341,13 @@ async def probe_proxy(
                 timeout=timeout,
                 allow_redirects=True,
             ) as response:
+                spoke_http = True
                 body = await response.text()
                 if response.status != 200:
                     errors.append(f"{response.status} from {test_url}")
                     continue
                 origin = _extract_origin(body)
-                if not origin:
+                if not origin or not _origin_is_public(origin):
                     errors.append(f"unexpected response from {test_url}")
                     continue
                 return ProbeOutcome(
@@ -1222,31 +1360,44 @@ async def probe_proxy(
                 )
         except asyncio.TimeoutError:
             errors.append(f"timeout from {test_url}")
+            timed_out = True
+            # Too slow for one echo URL is too slow for the pool; trying the
+            # others would only hold a verification slot for more timeouts.
+            break
+        except aiohttp.ClientHttpProxyError as exc:
+            spoke_http = True  # refused CONNECT with an HTTP status (403, 407, ...)
+            errors.append(f"proxy {exc.status} from {test_url}")
         except aiohttp.ClientError as exc:
             errors.append(f"{exc.__class__.__name__} from {test_url}")
         except Exception as exc:
             errors.append(f"{exc.__class__.__name__} from {test_url}")
 
-    # Auto-detection fallback: if HTTP probe failed, test whether candidate is a SOCKS5 proxy
-    if _SOCKS_OK and not proxy_url.startswith(("socks4://", "socks5://")):
-        socks_candidate = f"socks5://{clean_addr}"
-        try:
-            socks_res = await _probe_socks_proxy(
-                proxy=socks_candidate,
-                proxy_url=socks_candidate,
-                test_urls=test_urls[:1],
-                timeout_seconds=min(timeout_seconds, 6.0),
-                user_agent=user_agent,
-            )
+    # Auto-detection fallback: an endpoint that never answered in HTTP may be a
+    # SOCKS server listed without its scheme. SOCKS servers drop an HTTP request
+    # at once, so this only runs after fast refusals, never after a timeout.
+    if _SOCKS_OK and not spoke_http and not timed_out and not has_auth:
+        for scheme in ("socks5", "socks4"):
+            socks_candidate = f"{scheme}://{clean_addr}"
+            try:
+                socks_res = await _probe_socks_proxy(
+                    proxy=socks_candidate,
+                    proxy_url=socks_candidate,
+                    test_urls=test_urls[:1],
+                    timeout_seconds=min(timeout_seconds, 6.0),
+                    user_agent=user_agent,
+                )
+            except Exception:
+                break
             if socks_res.working:
                 return socks_res
-        except Exception:
-            pass
+            if socks_res.timed_out:
+                break
 
     return ProbeOutcome(
         proxy=proxy,
         working=False,
         error="; ".join(errors[:3]) if errors else "unknown error",
+        timed_out=timed_out,
     )
 
 
@@ -1269,17 +1420,74 @@ class ProxyHarvester:
         self.config = config
         self.sources = list(sources or DEFAULT_SOURCES)
         self.source_country: Dict[str, str] = {}
+        self._country_templates: List[str] = list(COUNTRY_SOURCE_TEMPLATES)
+        # proxy-sources.txt is re-read when it changes, as long as this
+        # harvester runs on it (and not only on a caller's own list).
+        default_set = set(DEFAULT_SOURCES)
+        self._extra_sources = [url for url in self.sources if url not in default_set]
+        self._sources_path: Optional[Path] = (
+            default_sources_path()
+            if any(url in default_set for url in self.sources)
+            else None
+        )
+        self._sources_mtime = self._sources_file_mtime()
         self._apply_country_sources()
         self.progress_callback = progress_callback
         self.records: Dict[str, ProxyRecord] = {}
         self.active_proxies: Set[str] = set()
         self.source_counts: Dict[str, int] = {}
         self.source_errors: Dict[str, str] = {}
+        # Discovery yield per list: of the new proxies it gave us, how many
+        # passed their first check. Steers the max_candidates budget.
+        self.source_tested: Dict[str, int] = {}
+        self.source_working: Dict[str, int] = {}
         self.session: Optional[aiohttp.ClientSession] = None
         self._last_collect = 0.0
         self._last_verify = 0.0
         self._last_save = 0.0
+        self._save_lock = asyncio.Lock()
         self._round_robin_index: int = 0
+        # proxy -> (retry not before [time.time()], failures). Survives record
+        # pruning, so a dead entry is not re-verified as "new" every cycle.
+        self._cooldown: Dict[str, Tuple[float, int]] = {}
+        self._source_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
+        self._source_skip_until: Dict[str, float] = {}  # lists that answered 404/410
+        self._host_backoff: Dict[str, float] = {}  # list hosts that rate-limited us
+        self._candidate_country: Dict[str, str] = {}  # country hints from JSON lists
+        self._enrich_attempts: Dict[str, int] = {}
+        self.last_collect_stats: Dict[str, int] = {}
+
+    def _sources_file_mtime(self) -> Optional[float]:
+        if self._sources_path is None:
+            return None
+        try:
+            return self._sources_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload_sources_file(self) -> None:
+        """Pick up edits to proxy-sources.txt without a restart."""
+        mtime = self._sources_file_mtime()
+        if mtime is None or mtime == self._sources_mtime:
+            return
+        self._sources_mtime = mtime
+        file_sources, templates = load_sources_file(self._sources_path)
+        if not file_sources and not templates:
+            print(
+                f"[sources] {self._sources_path} is empty after an edit - keeping the previous lists",
+                flush=True,
+            )
+            return
+        merged = list(dict.fromkeys(file_sources + self._extra_sources))
+        self.sources = merged
+        self._country_templates = templates
+        self.source_country = {}
+        self._apply_country_sources()
+        print(
+            f"[sources] reloaded {self._sources_path.name}: {len(file_sources)} lists, "
+            f"{len(templates)} country templates",
+            flush=True,
+        )
 
     def _emit_progress(self, **payload: Any) -> None:
         if not self.progress_callback:
@@ -1298,7 +1506,7 @@ class ProxyHarvester:
             country_code = code.strip().upper()
             if len(country_code) != 2 or not country_code.isalpha():
                 continue
-            for template in COUNTRY_SOURCE_TEMPLATES:
+            for template in self._country_templates:
                 url = template.format(cc=country_code.lower(), CC=country_code)
                 if url not in self.sources:
                     self.sources.append(url)
@@ -1314,6 +1522,11 @@ class ProxyHarvester:
         self.records = load_proxy_records(
             self.config.output_file, self.config.max_response_time
         )
+        stats_file = self.config.output_file
+        if not self.records and self.config.seed_file:
+            self.records = self._load_seed_records(self.config.seed_file)
+            stats_file = self.config.seed_file
+        self._load_source_stats(stats_file)
         self._rebuild_active_proxies()
         self._last_collect = time.monotonic() - self.config.update_interval
         self._last_verify = time.monotonic() - self.config.verify_interval
@@ -1323,6 +1536,69 @@ class ProxyHarvester:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self.session:
             await self.session.close()
+
+    def _load_seed_records(self, path: str) -> Dict[str, ProxyRecord]:
+        """Records from an earlier run's pool, re-checked first by the next cycle."""
+        try:
+            records = load_proxy_records(path, self.config.max_response_time)
+        except (OSError, ValueError):
+            return {}
+        for record in records.values():
+            # Let the current classifier label free proxies again; manual and
+            # Tor entries are re-tagged from their own files on every collect.
+            if not record.manual and record.proxy_type != "tor":
+                record.proxy_type = ""
+        if records:
+            print(f"[seed] loaded {len(records)} proxies from {path}", flush=True)
+        return records
+
+    def _load_source_stats(self, path: str) -> None:
+        """Restore per-list yield counters saved by save_pool."""
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        entries = raw.get("sources", []) if isinstance(raw, dict) else []
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("url"):
+                continue
+            try:
+                self.source_tested[entry["url"]] = int(entry.get("tested", 0))
+                self.source_working[entry["url"]] = int(entry.get("working", 0))
+            except (TypeError, ValueError):
+                continue
+
+    def _source_quality(self, url: str) -> float:
+        """Smoothed first-check hit rate of a list (an untested list scores 0.25)."""
+        return (self.source_working.get(url, 0) + 1) / (self.source_tested.get(url, 0) + 4)
+
+    def _cooling_down(self, proxy: str, now: float) -> bool:
+        entry = self._cooldown.get(proxy)
+        return entry is not None and entry[0] > now
+
+    def _schedule_retry(self, record: ProxyRecord) -> None:
+        """Back off re-verifying a candidate that keeps failing."""
+        if record.manual:
+            return
+        if (
+            record.successful_checks
+            and record.consecutive_failures < self.config.max_consecutive_failures
+        ):
+            return  # a proven proxy having a bad moment: normal re-check rhythm
+        _, failures = self._cooldown.get(record.proxy, (0.0, 0))
+        failures += 1
+        base = self.config.retry_backoff_seconds
+        if record.successful_checks:
+            base /= 3.0  # it worked before, so it is worth a sooner retry
+        delay = min(base * (2 ** (failures - 1)), self.config.max_retry_backoff_seconds)
+        self._cooldown[record.proxy] = (time.time() + delay, failures)
+
+    def _purge_cooldown(self, now: float) -> None:
+        if len(self._cooldown) < 50_000:
+            return
+        self._cooldown = {
+            proxy: entry for proxy, entry in self._cooldown.items() if entry[0] > now
+        }
 
     def _rebuild_active_proxies(self) -> None:
         self.active_proxies = {
@@ -1426,8 +1702,15 @@ class ProxyHarvester:
         ]
         if not candidates:
             return
-        # Process up to 300 candidates per cycle
+        # Process up to 300 candidates per cycle. Fewest attempts first, so a
+        # record whose lookups keep failing cannot starve newer ones; best
+        # proxies first within that.
+        candidates.sort(
+            key=lambda record: (self._enrich_attempts.get(record.proxy, 0), -record.score)
+        )
         candidates = candidates[:300]
+        for record in candidates:
+            self._enrich_attempts[record.proxy] = self._enrich_attempts.get(record.proxy, 0) + 1
 
         sem_anon = asyncio.Semaphore(_ANONYMITY_ENRICH_CONCURRENCY)
         sem_geo_fast = asyncio.Semaphore(_GEO_FAST_CONCURRENCY)
@@ -1550,41 +1833,76 @@ class ProxyHarvester:
         print(f"[platform-probe] candidates={len(candidates)} tally={tally}", flush=True)
     async def save_pool(self, force: bool = False) -> None:
         """Persist the active proxy pool to disk without blocking the event loop."""
-        now = time.monotonic()
-        if not force and (now - self._last_save) < self.config.auto_save_interval:
-            return
+        # Verification workers publish mid-batch; one writer at a time keeps
+        # two saves from racing on the same temp file.
+        async with self._save_lock:
+            now = time.monotonic()
+            if not force and (now - self._last_save) < self.config.auto_save_interval:
+                return
 
-        payload = {
-            "updated_at": to_iso(utc_now()),
-            "count": len(self.active_proxies),
-            "summary": {
-                "known_records": len(self.records),
-                "active_records": len(self.active_proxies),
-                "sources": len(self.sources),
-            },
-            "config": self.config.to_dict(),
-            "sources": [
-                {
-                    "url": url,
-                    "last_count": self.source_counts.get(url, 0),
-                    "last_error": self.source_errors.get(url, ""),
-                }
-                for url in self.sources
-            ],
-            "proxies": [record.to_dict() for record in self.ranked_active_records()],
-        }
-        output_path = Path(self.config.output_file)
-        tmp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
-        # H-1: Use asyncio.to_thread so disk I/O never blocks the event loop.
-        await asyncio.to_thread(
-            _write_json_atomic, str(output_path), str(tmp_path), payload
-        )
-        self._last_save = now
+            payload = {
+                "updated_at": to_iso(utc_now()),
+                "count": len(self.active_proxies),
+                "summary": {
+                    "known_records": len(self.records),
+                    "active_records": len(self.active_proxies),
+                    "sources": len(self.sources),
+                    "unique_candidates": self.last_collect_stats.get("unique_candidates", 0),
+                    "cooling_down": self.last_collect_stats.get("cooling_down", 0),
+                },
+                "config": self.config.to_dict(),
+                "sources": [
+                    {
+                        "url": url,
+                        "last_count": self.source_counts.get(url, 0),
+                        "last_error": self.source_errors.get(url, ""),
+                        "tested": self.source_tested.get(url, 0),
+                        "working": self.source_working.get(url, 0),
+                    }
+                    for url in self.sources
+                ],
+                "proxies": [record.to_dict() for record in self.ranked_active_records()],
+            }
+            output_path = Path(self.config.output_file)
+            tmp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+            # H-1: Use asyncio.to_thread so disk I/O never blocks the event loop.
+            await asyncio.to_thread(
+                _write_json_atomic, str(output_path), str(tmp_path), payload
+            )
+            self._last_save = now
 
-    async def _fetch_source(self, url: str, retries: int = 2) -> Set[str]:
+    # Parallel downloads allowed per list host. GitHub raw / jsDelivr serve
+    # hundreds of lists happily; API hosts (proxyscrape, geonode, ...) start
+    # answering 429 / Cloudflare 1015 when hit with dozens at once.
+    _HOST_FETCH_LIMITS = {"raw.githubusercontent.com": 32, "cdn.jsdelivr.net": 16}
+    _DEFAULT_HOST_FETCH_LIMIT = 4
+    _GONE_SOURCE_SKIP_SECONDS = 6 * 3600.0
+
+    def _cached_source(self, url: str) -> Dict[str, str]:
+        """Last good result of a list, while it is not older than an hour or two."""
+        cached = self._source_cache.get(url)
+        max_age = max(3600.0, self.config.country_source_refresh * 2)
+        if cached and time.time() - cached[0] <= max_age:
+            self.source_counts[url] = len(cached[1])
+            return cached[1]
+        self.source_counts[url] = 0
+        return {}
+
+    async def _fetch_source(self, url: str, retries: int = 2) -> Dict[str, str]:
+        """Download one list and return {proxy: country hint or ''}.
+
+        A failed download falls back to the list's last good result, so one
+        flaky fetch does not drop thousands of candidates for a cycle.
+        """
         if not self.session:
             raise RuntimeError("harvester session is not ready")
 
+        host = (urlsplit(url).hostname or "").lower()
+        if self._host_backoff.get(host, 0.0) > time.time():
+            self.source_errors[url] = "rate_limited (host backoff)"
+            return self._cached_source(url)
+
+        default_protocol = source_protocol_hint(url)
         last_error = ""
         for attempt in range(retries + 1):
             try:
@@ -1593,33 +1911,46 @@ class ProxyHarvester:
                     url, timeout=timeout, allow_redirects=True
                 ) as response:
                     if response.status == 429:
-                        self.source_counts[url] = 0
+                        retry_after = response.headers.get("Retry-After", "")
+                        wait = int(retry_after) if retry_after.isdigit() else 0
+                        # Stop asking this host for the rest of the cycle and a
+                        # bit beyond, instead of feeding its rate limiter.
+                        self._host_backoff[host] = time.time() + min(max(wait, 300), 1800)
                         self.source_errors[url] = "rate_limited"
-                        return set()
+                        return self._cached_source(url)
+                    if response.status in (404, 410):
+                        # Gone or moved: fix the line in proxy-sources.txt.
+                        self._source_skip_until[url] = time.time() + self._GONE_SOURCE_SKIP_SECONDS
+                        self._source_cache.pop(url, None)
+                        self.source_counts[url] = 0
+                        self.source_errors[url] = f"http {response.status}"
+                        return {}
                     if response.status != 200:
                         last_error = f"http {response.status}"
                         if attempt < retries:
                             await asyncio.sleep(1.0 * (attempt + 1))
                             continue
-                        self.source_counts[url] = 0
-                        self.source_errors[url] = last_error
-                        return set()
-                    proxies = extract_proxies(await response.text())
+                        break
+                    body = await response.text(errors="replace")
+                    if body.lstrip().startswith("error code: 1015"):
+                        self._host_backoff[host] = time.time() + 300
+                        self.source_errors[url] = "rate_limited"
+                        return self._cached_source(url)
+                    proxies = extract_proxies_with_hints(body, default_protocol)
                     self.source_counts[url] = len(proxies)
                     self.source_errors[url] = ""
+                    self._source_cache[url] = (time.time(), proxies)
                     return proxies
             except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
                 last_error = exc.__class__.__name__
                 if attempt < retries:
                     await asyncio.sleep(0.5 * (attempt + 1))
             except Exception as exc:
-                self.source_counts[url] = 0
-                self.source_errors[url] = exc.__class__.__name__
-                return set()
+                last_error = exc.__class__.__name__
+                break
 
-        self.source_counts[url] = 0
         self.source_errors[url] = last_error
-        return set()
+        return self._cached_source(url)
 
     def load_manual_proxies(self) -> Dict[str, Set[str]]:
         """Read user-supplied proxies (e.g. paid residential) from a text file.
@@ -1711,6 +2042,16 @@ class ProxyHarvester:
         return entries
 
     async def collect_candidates(self) -> Dict[str, Set[str]]:
+        """Fetch every list and return the candidates to verify this cycle.
+
+        Free lists hold hundreds of thousands of entries, far more than one
+        cycle can verify, so the max_candidates budget goes, in order, to:
+        user-supplied entries, proxies that worked before, then fresh entries
+        from the lists whose proxies have passed most often. Entries that just
+        failed are skipped until their retry backoff ends, and active proxies
+        that are not due for a re-check do not use up the budget at all.
+        """
+        self._maybe_reload_sources_file()
         candidate_sources: DefaultDict[str, Set[str]] = defaultdict(set)
         total_sources = len(self.sources)
         completed_sources = 0
@@ -1725,19 +2066,41 @@ class ProxyHarvester:
         # M-2: Limit concurrent source fetches to avoid port exhaustion on
         # slow connections. Reuse the same max_concurrent cap as verification.
         source_sem = asyncio.Semaphore(self.config.max_concurrent)
+        host_sems: Dict[str, asyncio.Semaphore] = {}
+
+        def host_sem(url: str) -> asyncio.Semaphore:
+            host = (urlsplit(url).hostname or "").lower()
+            if host not in host_sems:
+                host_sems[host] = asyncio.Semaphore(
+                    self._HOST_FETCH_LIMITS.get(host, self._DEFAULT_HOST_FETCH_LIMIT)
+                )
+            return host_sems[host]
 
         async def worker(url: str) -> None:
             nonlocal completed_sources
-            async with source_sem:
-                try:
-                    result = await self._fetch_source(url)
-                except Exception as exc:
-                    self.source_counts[url] = 0
-                    self.source_errors[url] = exc.__class__.__name__
-                    result = set()
+            now = time.time()
+            cached = self._source_cache.get(url)
+            if self._source_skip_until.get(url, 0.0) > now:
+                result: Dict[str, str] = {}  # answered 404 / 410 recently
+            elif (
+                cached
+                and url in self.source_country
+                and now - cached[0] < self.config.country_source_refresh
+            ):
+                result = cached[1]
+            else:
+                async with host_sem(url), source_sem:
+                    try:
+                        result = await self._fetch_source(url)
+                    except Exception as exc:
+                        self.source_counts[url] = 0
+                        self.source_errors[url] = exc.__class__.__name__
+                        result = {}
 
-            for proxy in result:
+            for proxy, country in result.items():
                 candidate_sources[proxy].add(url)
+                if country:
+                    self._candidate_country.setdefault(proxy, country)
 
             completed_sources += 1
             self._emit_progress(
@@ -1759,22 +2122,35 @@ class ProxyHarvester:
                 pinned.setdefault(proxy, set()).update(tags)
                 candidate_sources[proxy].update(tags)
 
-        ranked = sorted(
-            candidate_sources,
-            key=lambda proxy: (
-                0 if self.records.get(proxy) and self.records[proxy].manual else 1,
-                -len(candidate_sources[proxy]),
-                -(
-                    self.records[proxy].successful_checks
-                    if proxy in self.records
-                    else 0
-                ),
-                self.records[proxy].consecutive_failures
-                if proxy in self.records
-                else 0,
+        now = time.time()
+        self._purge_cooldown(now)
+        cooling_down = 0
+        due: List[str] = []
+        for proxy, tags in candidate_sources.items():
+            record = self.records.get(proxy)
+            if proxy in pinned:
+                due.append(proxy)
+            elif self._cooling_down(proxy, now):
+                cooling_down += 1
+            elif record is None or proxy not in self.active_proxies or self._needs_recheck(record):
+                due.append(proxy)
+            else:
+                record.add_sources(tags)  # active and fresh: nothing to verify
+
+        def rank_key(proxy: str):
+            record = self.records.get(proxy)
+            tags = candidate_sources[proxy]
+            quality = max((self._source_quality(url) for url in tags), default=0.0)
+            return (
+                0 if record and record.manual else 1,
+                0 if record and record.successful_checks else 1,
+                -round(quality, 2),
+                -len(tags),
+                record.consecutive_failures if record else 0,
                 proxy,
-            ),
-        )[: self.config.max_candidates]
+            )
+
+        ranked = sorted(due, key=rank_key)[: self.config.max_candidates]
 
         trimmed: Dict[str, Set[str]] = {}
         for proxy in ranked:
@@ -1789,25 +2165,35 @@ class ProxyHarvester:
                 record = self.records.setdefault(proxy, ProxyRecord(proxy=proxy))
                 record.add_sources(tags)
 
-        # Country-targeted sources: pre-tag records with the list's country so
-        # per-country coverage grows immediately (geo enrichment only fills
-        # gaps for records from non-country sources).
-        if self.source_country:
-            for proxy, tags in trimmed.items():
-                record = self.records.get(proxy)
-                if record is None or record.country:
-                    continue
-                for url in tags:
-                    country_code = self.source_country.get(url)
-                    if country_code:
-                        record.country = country_code
-                        break
+        # Country-targeted sources (and JSON lists that name the country):
+        # pre-tag records so per-country coverage grows immediately (geo
+        # enrichment only fills gaps for records from other sources).
+        for proxy, tags in trimmed.items():
+            record = self.records.get(proxy)
+            if record is None or record.country:
+                continue
+            for url in tags:
+                country_code = self.source_country.get(url)
+                if country_code:
+                    record.country = country_code
+                    break
+            else:
+                hint = self._candidate_country.get(proxy)
+                if hint:
+                    record.country = hint
 
+        self.last_collect_stats = {
+            "unique_candidates": len(candidate_sources),
+            "cooling_down": cooling_down,
+            "queued": len(trimmed),
+        }
         self._emit_progress(
             phase="collect_complete",
             total_sources=total_sources,
             completed_sources=completed_sources,
             collected_candidates=len(trimmed),
+            unique_candidates=len(candidate_sources),
+            cooling_down=cooling_down,
         )
         return trimmed
 

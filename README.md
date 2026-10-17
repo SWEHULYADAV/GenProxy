@@ -1,8 +1,9 @@
-# Proxy Generator
+# GenProxy
 
-Local BrightData-style proxy service for personal use.
+Local BrightData-style multi-route proxy service & threat intelligence pool.
 
-Made by Rahul Yadav (SWEHUL Yadav)
+**Repository:** [https://github.com/SWEHULYADAV/GenProxy](https://github.com/SWEHULYADAV/GenProxy)  
+**Author:** Rahul Yadav (SWEHUL Yadav)
 
 ## Disclaimer
 
