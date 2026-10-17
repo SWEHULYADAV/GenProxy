@@ -72,13 +72,16 @@ def test_a_bare_duplicate_of_a_scheme_or_auth_endpoint_is_not_verified_twice_as_
     assert extract_proxies("u:p@9.9.9.9:3128 9.9.9.9:3128") == {"http://u:p@9.9.9.9:3128"}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known gap: lists from the internet are untrusted, yet loopback / private / link-local hosts are accepted and "
-    "later probed as 'proxies' (an SSRF-style probe of the local network). Manual and Tor entries legitimately "
-    "use 127.0.0.1, so the filter belongs in the free-list path only. Remove this marker when it is fixed."))
 @pytest.mark.parametrize("bad", ["127.0.0.1:1712", "10.0.0.5:3128", "192.168.1.1:8080", "169.254.169.254:80", "0.0.0.0:80"])
 def test_free_list_extraction_drops_non_public_hosts(bad):
     assert extract_proxies(bad) == set()
+
+
+def test_self_public_ip_is_excluded(monkeypatch):
+    import proxy_core
+    monkeypatch.setattr(proxy_core, "_MY_PUBLIC_IP", "103.157.222.55")
+    assert extract_proxies("103.157.222.55:8080") == set()
+    assert proxy_core.is_safe_proxy_host("103.157.222.55") is False
 
 
 # ---- liveness and scoring ---------------------------------------------------------------------------

@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 import signal
+import socket
 import sys
 import time
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -213,6 +216,64 @@ _PLATFORM_PROBE_CONCURRENCY = 24
 _PLATFORM_REPROBE_SECONDS = 900.0
 
 
+# ---------------------------------------------------------------------------
+#  Safety & Self-Exclusion Shield
+#  Guarantees that the operator's own public IP, LAN IPs, and private/internal
+#  networks (127.0.0.0/8, 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12, 169.254.0.0/16)
+#  can NEVER be parsed as a proxy candidate, scanned, probed, or exported.
+# ---------------------------------------------------------------------------
+_EXCLUDED_HOSTS: Set[str] = {
+    "127.0.0.1", "::1", "0.0.0.0", "localhost"
+}
+_MY_PUBLIC_IP: Optional[str] = None
+_MY_PUBLIC_IP_RESOLVED = False
+
+
+def get_my_public_ip() -> Optional[str]:
+    """Resolve and cache the local machine's public IP to ensure strict self-exclusion."""
+    global _MY_PUBLIC_IP, _MY_PUBLIC_IP_RESOLVED
+    if _MY_PUBLIC_IP_RESOLVED:
+        return _MY_PUBLIC_IP
+    _MY_PUBLIC_IP_RESOLVED = True
+    for provider in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(provider, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                ip_str = resp.read().decode("utf-8").strip()
+                if ip_str and _is_valid_public_ip(ip_str):
+                    _MY_PUBLIC_IP = ip_str
+                    _EXCLUDED_HOSTS.add(ip_str)
+                    return _MY_PUBLIC_IP
+        except Exception:
+            continue
+    return None
+
+
+def _is_valid_public_ip(ip_str: str) -> bool:
+    try:
+        obj = ipaddress.ip_address(ip_str)
+        return obj.is_global and not obj.is_private and not obj.is_loopback and not obj.is_link_local
+    except ValueError:
+        return False
+
+
+def is_safe_proxy_host(host: str) -> bool:
+    """Check if host is a safe, valid public IP that does NOT match self or private networks."""
+    clean_host = host.strip().lower()
+    if not clean_host or clean_host in _EXCLUDED_HOSTS:
+        return False
+    # If self public IP was resolved, check it
+    if _MY_PUBLIC_IP and clean_host == _MY_PUBLIC_IP:
+        return False
+    try:
+        addr = ipaddress.ip_address(clean_host)
+        if not addr.is_global or addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved:
+            return False
+    except ValueError:
+        return False
+    return True
+
+
 def normalize_proxy(candidate: str) -> Optional[str]:
     value = candidate.strip()
     if not value:
@@ -244,6 +305,9 @@ def normalize_proxy(candidate: str) -> Optional[str]:
     host, port_text = value.rsplit(":", 1)
     octets = host.split(".")
     if len(octets) != 4:
+        return None
+
+    if not is_safe_proxy_host(host):
         return None
 
     try:
@@ -314,6 +378,12 @@ def normalize_manual_proxy(candidate: str) -> Optional[str]:
         return None
 
     if not 1 <= port <= 65535:
+        return None
+
+    if _IPV4_PATTERN.match(host):
+        if not is_safe_proxy_host(host) and not host.startswith("100.") and not (host == "127.0.0.1" and 9000 <= port <= 9999):
+            return None
+    elif host.lower() in _EXCLUDED_HOSTS:
         return None
 
     if auth:
@@ -605,7 +675,14 @@ async def lookup_proxy_geo_batch(
                 json=chunk,
                 timeout=timeout,
             ) as response:
+                if response.status == 429:
+                    ttl_header = response.headers.get("X-Ttl", "10")
+                    ttl = int(ttl_header) if ttl_header.isdigit() else 10
+                    await asyncio.sleep(min(ttl, 15))
+                    break
                 if response.status == 200:
+                    rl_header = response.headers.get("X-Rl", "10")
+                    rl = int(rl_header) if rl_header.isdigit() else 10
                     data = await response.json(content_type=None)
                     if isinstance(data, list):
                         for item in data:
@@ -617,6 +694,8 @@ async def lookup_proxy_geo_batch(
                                         "proxy_type": _classify_proxy_type(item),
                                         "isp": str(item.get("isp", "")),
                                     }
+                    if rl <= 1:
+                        await asyncio.sleep(4.0)
         except Exception:
             pass
         if i + 100 < len(unique_ips):
@@ -1068,6 +1147,8 @@ async def _probe_socks_proxy(
 
 async def tcp_preflight_check(host: str, port: int, timeout: float = 1.8) -> bool:
     """Pre-flight check: ensure remote TCP port responds with SYN-ACK within timeout."""
+    if not is_safe_proxy_host(host) and not host.startswith("100.") and not (host == "127.0.0.1" and 9000 <= port <= 9999):
+        return False
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),

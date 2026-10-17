@@ -2791,6 +2791,24 @@ async def handle_proxies(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "count": len(proxies), "proxies": proxies})
 
 
+def _safe_extract_endpoint(proxy_str: str) -> tuple[str, str, str]:
+    """Return (clean_ip_or_host, port_str, sanitized_proxy_url) with credentials stripped from ip/port and redacted in URL."""
+    raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
+    scheme = proxy_str.split("://", 1)[0] if "://" in proxy_str else "http"
+    if "@" in raw:
+        auth, host_port = raw.rsplit("@", 1)
+        user = auth.split(":", 1)[0]
+        sanitized_url = f"{scheme}://{user}:***@{host_port}"
+    else:
+        host_port = raw
+        sanitized_url = f"{scheme}://{host_port}"
+    if ":" in host_port:
+        ip_part, port_part = host_port.rsplit(":", 1)
+    else:
+        ip_part, port_part = host_port, ""
+    return ip_part, port_part, sanitized_url
+
+
 async def handle_export_txt(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
     limit = int(request.query.get("limit", "1000"))
@@ -2815,12 +2833,11 @@ async def handle_export_txt(request: web.Request) -> web.Response:
     )
     lines = []
     for r in records:
+        ip_part, port_part, sanitized_url = _safe_extract_endpoint(r.proxy)
         if with_scheme:
-            lines.append(r.proxy)
+            lines.append(sanitized_url)
         else:
-            # strip scheme
-            raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
-            lines.append(raw)
+            lines.append(f"{ip_part}:{port_part}" if port_part else ip_part)
     body = "\n".join(lines) + ("\n" if lines else "")
     return web.Response(text=body, content_type="text/plain", charset="utf-8")
 
@@ -2855,13 +2872,10 @@ async def handle_export_csv(request: web.Request) -> web.Response:
         "score", "first_seen_utc", "last_seen_success_utc", "last_checked_utc"
     ])
     for r in records:
-        raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
-        parts = raw.split(":")
-        ip = parts[0] if len(parts) > 0 else ""
-        port = parts[1] if len(parts) > 1 else ""
+        ip_part, port_part, _ = _safe_extract_endpoint(r.proxy)
         writer.writerow([
-            ip,
-            port,
+            ip_part,
+            port_part,
             r.protocol,
             r.country,
             r.anonymity,
@@ -2908,14 +2922,11 @@ async def handle_export_evidence_json(request: web.Request) -> web.Response:
     )
     items = []
     for r in records:
-        raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
-        parts = raw.split(":")
-        ip = parts[0] if len(parts) > 0 else ""
-        port = parts[1] if len(parts) > 1 else ""
+        ip_part, port_part, sanitized_url = _safe_extract_endpoint(r.proxy)
         items.append({
-            "ip": ip,
-            "port": int(port) if port.isdigit() else port,
-            "proxy": r.proxy,
+            "ip": ip_part,
+            "port": int(port_part) if port_part.isdigit() else port_part,
+            "proxy": sanitized_url,
             "protocol": r.protocol,
             "country": r.country,
             "anonymity": r.anonymity,

@@ -191,16 +191,31 @@ def run_export() -> None:
             continue
         filtered.append(p)
 
+    def _safe_endpoint(proxy_str: str):
+        raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
+        scheme = proxy_str.split("://", 1)[0] if "://" in proxy_str else "http"
+        if "@" in raw:
+            auth, host_port = raw.rsplit("@", 1)
+            user = auth.split(":", 1)[0]
+            sanitized_url = f"{scheme}://{user}:***@{host_port}"
+        else:
+            host_port = raw
+            sanitized_url = f"{scheme}://{host_port}"
+        if ":" in host_port:
+            ip_part, port_part = host_port.rsplit(":", 1)
+        else:
+            ip_part, port_part = host_port, ""
+        return ip_part, port_part, sanitized_url
+
     out_text = ""
     if export_args.format == "txt":
         lines = []
         for p in filtered:
-            proxy_str = p.get("proxy", "")
+            ip_part, port_part, sanitized_url = _safe_endpoint(p.get("proxy", ""))
             if export_args.with_scheme:
-                lines.append(proxy_str)
+                lines.append(sanitized_url)
             else:
-                raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
-                lines.append(raw)
+                lines.append(f"{ip_part}:{port_part}" if port_part else ip_part)
         out_text = "\n".join(lines) + ("\n" if lines else "")
     elif export_args.format == "csv":
         buf = io.StringIO()
@@ -211,13 +226,9 @@ def run_export() -> None:
             "successful_checks", "consecutive_failures", "proxy_type", "score"
         ])
         for p in filtered:
-            proxy_str = p.get("proxy", "")
-            raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
-            parts = raw.split(":")
-            ip = parts[0] if len(parts) > 0 else ""
-            port = parts[1] if len(parts) > 1 else ""
+            ip_part, port_part, _ = _safe_endpoint(p.get("proxy", ""))
             writer.writerow([
-                ip, port, p.get("protocol", ""), p.get("country", ""),
+                ip_part, port_part, p.get("protocol", ""), p.get("country", ""),
                 p.get("anonymity", ""), p.get("speed_tier", ""),
                 round(p.get("avg_response_time", 0.0) * 1000, 1),
                 p.get("success_rate", 0.0), p.get("total_checks", 0),
@@ -226,13 +237,19 @@ def run_export() -> None:
             ])
         out_text = buf.getvalue()
     elif export_args.format == "json":
+        sanitized_filtered = []
+        for p in filtered:
+            p_copy = dict(p)
+            _, _, sanitized_url = _safe_endpoint(p.get("proxy", ""))
+            p_copy["proxy"] = sanitized_url
+            sanitized_filtered.append(p_copy)
         bundle = {
             "ok": True,
             "format": "threat-intelligence-evidence",
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "source_pool": str(pool_file),
-            "total_records": len(filtered),
-            "evidence": filtered,
+            "total_records": len(sanitized_filtered),
+            "evidence": sanitized_filtered,
         }
         out_text = json.dumps(bundle, indent=2)
 
