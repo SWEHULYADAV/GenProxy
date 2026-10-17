@@ -584,6 +584,46 @@ async def lookup_proxy_geo(
         return {}
 
 
+async def lookup_proxy_geo_batch(
+    session: aiohttp.ClientSession,
+    ips: List[str],
+    timeout_seconds: float = 8.0,
+) -> Dict[str, Dict[str, Any]]:
+    """Return {ip: {"country": ..., "proxy_type": ...}} using ip-api.com/batch (up to 100 IPs per request)."""
+    if not ips:
+        return {}
+    results: Dict[str, Dict[str, Any]] = {}
+    batch_url = "http://ip-api.com/batch?fields=status,countryCode,hosting,mobile,isp,query"
+    # Process unique IPs in chunks of 100
+    unique_ips = list(dict.fromkeys(ip.strip() for ip in ips if ip.strip()))
+    for i in range(0, len(unique_ips), 100):
+        chunk = unique_ips[i : i + 100]
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with session.post(
+                batch_url,
+                json=chunk,
+                timeout=timeout,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get("status") == "success":
+                                q = item.get("query", "")
+                                if q:
+                                    results[q] = {
+                                        "country": str(item.get("countryCode", "")),
+                                        "proxy_type": _classify_proxy_type(item),
+                                        "isp": str(item.get("isp", "")),
+                                    }
+        except Exception:
+            pass
+        if i + 100 < len(unique_ips):
+            await asyncio.sleep(0.5)
+    return results
+
+
 async def lookup_proxy_country(
     session: aiohttp.ClientSession,
     ip: str,
@@ -1294,7 +1334,7 @@ class ProxyHarvester:
         return record
 
     async def _enrich_pool(self) -> None:
-        """Detect anonymity level, country and proxy type for active proxies that lack this data."""
+        """Detect anonymity level, country and proxy type for active proxies in fast batches."""
         if not self.session:
             return
         candidates = [
@@ -1305,22 +1345,16 @@ class ProxyHarvester:
         ]
         if not candidates:
             return
-        candidates = candidates[:_ENRICH_BATCH_SIZE]
+        # Process up to 300 candidates per cycle
+        candidates = candidates[:300]
 
         sem_anon = asyncio.Semaphore(_ANONYMITY_ENRICH_CONCURRENCY)
-        sem_geo = asyncio.Semaphore(_GEO_ENRICH_CONCURRENCY)
         sem_geo_fast = asyncio.Semaphore(_GEO_FAST_CONCURRENCY)
-        type_budget = _TYPE_ENRICH_PER_CYCLE
-        type_lock = asyncio.Lock()
 
-        async def enrich(record: ProxyRecord) -> None:
-            nonlocal type_budget
+        async def enrich_anon_and_fast_country(record: ProxyRecord) -> None:
             proxy_url = record.proxy if "://" in record.proxy else f"http://{record.proxy}"
             ip = _extract_ip(proxy_url)
             try:
-                # Country first: fast parallel provider (geojs.io — no key, no
-                # rate cap) so per-country coverage grows at full batch speed
-                # instead of waiting on ip-api.com's 45 req/min free tier.
                 if not record.country and ip:
                     async with sem_geo_fast:
                         country = await lookup_country_fast(
@@ -1339,31 +1373,35 @@ class ProxyHarvester:
                         )
                         if anon:
                             record.anonymity = anon
-                # Proxy-type classification stays on ip-api (the only provider
-                # with the hosting/mobile flags) but is budgeted per cycle to
-                # respect its free tier even with big verify batches.
-                if not record.proxy_type and ip:
-                    async with type_lock:
-                        allowed = type_budget > 0
-                        if allowed:
-                            type_budget -= 1
-                    if allowed:
-                        async with sem_geo:
-                            await asyncio.sleep(_GEO_DELAY_SECONDS)
-                            geo = await lookup_proxy_geo(
-                                self.session,  # type: ignore[arg-type]
-                                ip,
-                                5.0,
-                            )
-                        if geo:
-                            if not record.country and geo.get("country"):
-                                record.country = str(geo["country"])
-                            if not record.proxy_type and geo.get("proxy_type"):
-                                record.proxy_type = str(geo["proxy_type"])
             except Exception:
                 pass
 
-        await asyncio.gather(*(enrich(record) for record in candidates))
+        # 1. Parallel anonymity + fast country resolution
+        await asyncio.gather(*(enrich_anon_and_fast_country(record) for record in candidates))
+
+        # 2. Ultra-fast bulk proxy_type (Residential vs Datacenter) resolution via ip-api.com/batch (100 IPs/req)
+        needed_ips = [
+            _extract_ip(r.proxy)
+            for r in candidates
+            if not r.proxy_type and _extract_ip(r.proxy)
+        ]
+        if needed_ips:
+            try:
+                batch_geo = await lookup_proxy_geo_batch(
+                    self.session,
+                    needed_ips[:300],
+                    timeout_seconds=8.0,
+                )
+                for record in candidates:
+                    ip = _extract_ip(record.proxy)
+                    if ip in batch_geo:
+                        g = batch_geo[ip]
+                        if not record.country and g.get("country"):
+                            record.country = str(g["country"])
+                        if not record.proxy_type and g.get("proxy_type"):
+                            record.proxy_type = str(g["proxy_type"])
+            except Exception:
+                pass
 
     async def _probe_platforms(self) -> None:
         """Tag active proxies with the platforms they can actually reach.
