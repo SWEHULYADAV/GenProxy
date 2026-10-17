@@ -1257,8 +1257,7 @@ IP/UA change. Re-run `mint` when replays start failing.
 `/api/p/<code>`) and product HTML (`/p/<code>`) answer curl_cffi directly —
 also through the free pool; Meesho's `POST /api/v1/products/search` returns
 full catalog JSON on the direct route. Ajio **headful** mint passes
-(`~-1~` validated); headless gets Access Denied. Details:
-`IP-ENGINE-INTEGRATION.md` recipe 6, `RESEARCH-2026-10-17.md` §2.5.
+(`~-1~` validated); headless gets Access Denied.
 
 ## Tunnel country pinning (engine integration)
 
@@ -1279,8 +1278,7 @@ If the pool has no proxies for that country the tunnel answers
 `502 No Proxies Available For Country SG` — an explicit failure instead of a
 silently wrong-country exit. `residential-proxies.txt` accepts an explicit
 `|CC` tag for provider gateways (`gate.provider.com:8080|SG`) so paid
-country residential feeds straight into the same pinning. Full engine
-integration guide: `IP-ENGINE-INTEGRATION.md`.
+country residential feeds straight into the same pinning.
 
 ## Stability hardening (2026-10-17)
 
@@ -1290,14 +1288,11 @@ integration guide: `IP-ENGINE-INTEGRATION.md`.
 - `faulthandler` is enabled at startup and stdout/stderr are line-buffered, so
   hard crashes leave a stack trace even when the service is started without
   `-u`.
-- Recommended start command: `venv\Scripts\python.exe -u Proxy-api.py`.
+- Recommended start command: `python app.py`.
 
 ## License, provenance & secrets hygiene
 
-- This folder is a local instance of a third-party educational project
-  ("educational/personal use" disclaimer). No LICENSE file was found in the
-  source tree — keep the folder internal, do not commit it into other repos
-  and do not redistribute it (see `IP-ENGINE-INTEGRATION.md`).
+- This folder is an educational and testing project.
 - `.gitignore` now excludes `proxy-service-config.env`, `residential-proxies.txt`,
   `akamai-cookies.json` and `output/`; a blank-key
   `proxy-service-config.example.env` and `residential-proxies.example.txt` are
@@ -1305,7 +1300,7 @@ integration guide: `IP-ENGINE-INTEGRATION.md`.
 
 ## CLI Reference
 
-Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/Proxy-api.py>):
+Most important flags for `app.py`:
 
 | Flag | Default | Meaning |
 |---|---|---|
