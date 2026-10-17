@@ -49,6 +49,7 @@ Main files:
 - [backend/](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/) - all backend modules & engine files:
   - [backend/Proxy-api.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Proxy-api.py) - local API service & HTTP proxy tunnel
   - [backend/proxy_core.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/proxy_core.py) - source collection, validation, scoring, active pool logic
+  - [backend/proxy_sources.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/proxy_sources.py) - the free proxy list URLs (edit here when a list dies; `python app.py sources` finds dead ones)
   - [backend/Live-proxies.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Live-proxies.py) - live proxy monitor window
   - [backend/proxy_mcp.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/proxy_mcp.py) - MCP server for AI agent operations
   - [backend/stealth_browser.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/stealth_browser.py) - stealth browser automation helper
@@ -1474,7 +1475,38 @@ Examples include:
 - `proxy-list.download`
 - `openproxylist`
 
-The active runtime source list is maintained directly in [proxy_core.py](</c:/Users/Admin/Desktop/Proxy_Generation-main/proxy_core.py:39>) under `DEFAULT_SOURCES`.
+The source lists live in [backend/proxy_sources.py](backend/proxy_sources.py): `SOURCES` (one URL per line)
+and `COUNTRY_SOURCE_TEMPLATES`. When a list dies or moves, edit that file only; a running service picks the
+change up on its next collect cycle.
+
+- Put `#` in front of a line to switch a list off, or move it to `DEAD_SOURCES` (kept there with the date).
+- Bare `ip:port` entries in a list whose URL names `socks5` / `socks4` are tested as that protocol.
+- JSON APIs (Geonode style: `ip`, `port`, `protocols`, `country`) are read too.
+- A URL with `{cc}` / `{CC}` is a country template, expanded for every code in `PROXY_SERVICE_COUNTRY_SOURCES`.
+- If the file is missing or an edit breaks it, a running service keeps its previous lists; a fresh start falls
+  back to five built-in lists and prints a warning.
+
+Find dead or empty lists:
+
+```powershell
+venv\Scripts\python app.py sources                    # every list in backend/proxy_sources.py
+venv\Scripts\python app.py sources --countries us,in  # plus the country templates for those codes
+```
+
+### How a cycle spends its verification budget
+
+The lists hold hundreds of thousands of entries; one cycle verifies `PROXY_SERVICE_MAX_CANDIDATES` of them.
+
+- Entries that failed are retried later with a growing backoff (15 min, 30 min, 1 h ... up to 6 h), so each
+  cycle checks entries it has not just seen dead instead of the same top 2000 again.
+- Proxies that worked before go first, then fresh entries from the lists whose proxies pass most often
+  (per-list `tested` / `working` counts are saved in the pool JSON under `sources`).
+- A new API or live-monitor session starts from the previous session's pool, so a restart is warm.
+- An endpoint listed as `http://` that turns out to be SOCKS (or SOCKS4 vs SOCKS5) is kept under the protocol
+  that works.
+- `proxy_type=residential` means ip-api did not flag the IP as hosting or mobile *and* its ISP / org / AS name
+  does not look like a hosting, cloud or backbone network. It is a best guess from public data, not proof of a
+  home connection; for guaranteed residential exits, put your own in `residential-proxies.txt`.
 
 ### Note on ownership
 

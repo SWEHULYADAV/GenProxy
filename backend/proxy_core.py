@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
-import os
 import re
+import runpy
 import signal
 import socket
 import sys
@@ -48,17 +48,17 @@ DEFAULT_TEST_URLS = (
 )
 
 # ---------------------------------------------------------------------------
-# Source lists live in proxy-sources.txt (project root), so a dead or moved
-# list is fixed by editing that file instead of this module.
-# PROXY_SERVICE_SOURCES_FILE points at a different file. A URL containing
-# {cc} / {CC} is a country template (lower / upper ISO-2); every record it
-# returns is pre-tagged with that country, so per-country coverage grows even
-# before geo enrichment has seen it.
+# Source lists live in backend/proxy_sources.py (SOURCES and
+# COUNTRY_SOURCE_TEMPLATES), so a dead or moved list is fixed by editing that
+# file instead of this module; a running harvester re-reads it when it changes.
+# A URL containing {cc} / {CC} is a country template (lower / upper ISO-2);
+# every record it returns is pre-tagged with that country, so per-country
+# coverage grows even before geo enrichment has seen it.
 # ---------------------------------------------------------------------------
-SOURCES_FILE_NAME = "proxy-sources.txt"
+SOURCES_FILE_NAME = "proxy_sources.py"
 _COUNTRY_PLACEHOLDERS = ("{cc}", "{CC}")
 
-# Used only when proxy-sources.txt is missing or empty, so the pool still fills.
+# Used only when proxy_sources.py is missing, empty or broken, so the pool still fills.
 _FALLBACK_SOURCES = (
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
@@ -72,29 +72,19 @@ _FALLBACK_COUNTRY_TEMPLATES = (
 
 
 def default_sources_path() -> Path:
-    override = os.environ.get("PROXY_SERVICE_SOURCES_FILE", "").strip()
-    if override:
-        return Path(override)
-    here = Path(__file__).resolve().parent
-    for candidate in (here.parent / SOURCES_FILE_NAME, here / SOURCES_FILE_NAME):
-        if candidate.exists():
-            return candidate
-    return here.parent / SOURCES_FILE_NAME
+    return Path(__file__).resolve().parent / SOURCES_FILE_NAME
 
 
-def parse_sources_text(text: str) -> Tuple[List[str], List[str]]:
-    """Split a proxy-sources.txt body into (list URLs, country templates).
-
-    Blank lines and lines starting with '#' are skipped; anything after the
-    URL on the same line (a note) is ignored.
-    """
+def split_source_urls(urls: Iterable[Any]) -> Tuple[List[str], List[str]]:
+    """De-duplicate into (list URLs, country templates); anything not an http(s) URL is dropped."""
     sources: List[str] = []
     templates: List[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    for item in urls:
+        if not isinstance(item, str):
             continue
-        url = stripped.split()[0]
+        url = item.strip()
+        if not url.startswith(("http://", "https://")):
+            continue
         target = templates if any(p in url for p in _COUNTRY_PLACEHOLDERS) else sources
         if url not in target:
             target.append(url)
@@ -102,19 +92,35 @@ def parse_sources_text(text: str) -> Tuple[List[str], List[str]]:
 
 
 def load_sources_file(path: str | Path | None = None) -> Tuple[List[str], List[str]]:
+    """Read SOURCES and COUNTRY_SOURCE_TEMPLATES from a proxy_sources.py file.
+
+    The file is run in its own namespace rather than imported, so an edited
+    copy is always read fresh. A broken edit gives ([], []) and a warning
+    instead of taking the harvester down.
+    """
     file_path = Path(path) if path else default_sources_path()
-    try:
-        text = file_path.read_text(encoding="utf-8")
-    except OSError:
+    if not file_path.is_file():
         return [], []
-    return parse_sources_text(text)
+    try:
+        namespace = runpy.run_path(str(file_path))
+    except Exception as exc:
+        print(
+            f"[sources] could not read {file_path}: {exc.__class__.__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return [], []
+    urls = list(namespace.get("SOURCES") or []) + list(
+        namespace.get("COUNTRY_SOURCE_TEMPLATES") or []
+    )
+    return split_source_urls(urls)
 
 
 def _load_default_sources() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     sources, templates = load_sources_file()
     if not sources and not templates:
         print(
-            f"[sources] {default_sources_path()} is missing or empty - "
+            f"[sources] {default_sources_path()} is missing, empty or broken - "
             "using the built-in fallback lists",
             file=sys.stderr,
         )
@@ -719,6 +725,11 @@ _DATACENTER_NAME_HINTS = (
     "colocrossing", "hivelocity", "gcore", "g-core", "upcloud", "kamatera",
     "racknerd", "frantech", "ponynet", "netcup", "aeza", "stark industries",
     "selectel", "timeweb", "hostkey", "worldstream", "tzulo",
+    # Seen labelled residential in a live pool (2026-10-17): registrars,
+    # hosters, an IDC, a Turkish cloud ("bulut") and transit carriers.
+    # "idc network", not "idc": Midco is a home ISP.
+    "registrar", "beget", "melbikomas", "idc network", "bulut",
+    "cogent", "ufinet", "seacom",
 )
 
 
@@ -1435,7 +1446,7 @@ class ProxyHarvester:
         self.sources = list(sources or DEFAULT_SOURCES)
         self.source_country: Dict[str, str] = {}
         self._country_templates: List[str] = list(COUNTRY_SOURCE_TEMPLATES)
-        # proxy-sources.txt is re-read when it changes, as long as this
+        # proxy_sources.py is re-read when it changes, as long as this
         # harvester runs on it (and not only on a caller's own list).
         default_set = set(DEFAULT_SOURCES)
         self._extra_sources = [url for url in self.sources if url not in default_set]
@@ -1480,7 +1491,7 @@ class ProxyHarvester:
             return None
 
     def _maybe_reload_sources_file(self) -> None:
-        """Pick up edits to proxy-sources.txt without a restart."""
+        """Pick up edits to proxy_sources.py without a restart."""
         mtime = self._sources_file_mtime()
         if mtime is None or mtime == self._sources_mtime:
             return
@@ -1488,7 +1499,7 @@ class ProxyHarvester:
         file_sources, templates = load_sources_file(self._sources_path)
         if not file_sources and not templates:
             print(
-                f"[sources] {self._sources_path} is empty after an edit - keeping the previous lists",
+                f"[sources] {self._sources_path} is empty or broken after an edit - keeping the previous lists",
                 flush=True,
             )
             return
@@ -1604,7 +1615,7 @@ class ProxyHarvester:
         base = self.config.retry_backoff_seconds
         if record.successful_checks:
             base /= 3.0  # it worked before, so it is worth a sooner retry
-        delay = min(base * (2 ** (failures - 1)), self.config.max_retry_backoff_seconds)
+        delay = min(base * (2 ** min(failures - 1, 20)), self.config.max_retry_backoff_seconds)
         self._cooldown[record.proxy] = (time.time() + delay, failures)
 
     def _purge_cooldown(self, now: float) -> None:
@@ -1933,7 +1944,7 @@ class ProxyHarvester:
                         self.source_errors[url] = "rate_limited"
                         return self._cached_source(url)
                     if response.status in (404, 410):
-                        # Gone or moved: fix the line in proxy-sources.txt.
+                        # Gone or moved: fix the line in proxy_sources.py.
                         self._source_skip_until[url] = time.time() + self._GONE_SOURCE_SKIP_SECONDS
                         self._source_cache.pop(url, None)
                         self.source_counts[url] = 0

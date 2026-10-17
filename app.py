@@ -8,6 +8,7 @@ Replaces legacy .bat scripts with a modern, cross-platform CLI:
     python app.py live                    # Run terminal live monitor window
     python app.py both                    # Start both Live Monitor and Proxy API service concurrently
     python app.py harvest                 # Run standalone proxy harvester
+    python app.py sources                 # Check backend/proxy_sources.py for dead / empty lists
     python app.py mcp                     # Run Model Context Protocol server (for AI agents)
     python app.py tor                     # Run local country-pinned Tor manager
     python app.py direct [url]            # Direct fetch with real Chrome TLS fingerprint
@@ -262,6 +263,70 @@ def run_export() -> None:
         sys.stdout.write(out_text)
 
 
+def run_sources_check() -> None:
+    """Fetch every list in backend/proxy_sources.py once and report the dead or empty ones."""
+    import argparse
+    import asyncio
+    from urllib.parse import urlsplit
+
+    import aiohttp
+    from proxy_core import HarvesterConfig, ProxyHarvester, default_sources_path, run_async_entrypoint
+
+    parser = argparse.ArgumentParser(
+        prog="app.py sources",
+        description="Check every proxy list URL in backend/proxy_sources.py and show which are dead or empty.",
+    )
+    parser.add_argument(
+        "--countries", default="off",
+        help="Also check country templates for these ISO-2 codes, e.g. 'us,in,sg' or 'default' (default: off)",
+    )
+    opts = parser.parse_args(sys.argv[2:])
+
+    async def check():
+        harvester = ProxyHarvester(HarvesterConfig(country_source_codes=opts.countries))
+        host_sems: Dict[str, asyncio.Semaphore] = {}
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": harvester.config.user_agent}, trust_env=False
+        ) as session:
+            harvester.session = session
+
+            async def one(url: str):
+                host = (urlsplit(url).hostname or "").lower()
+                sem = host_sems.setdefault(host, asyncio.Semaphore(
+                    harvester._HOST_FETCH_LIMITS.get(host, harvester._DEFAULT_HOST_FETCH_LIMIT)))
+                async with sem:
+                    found = await harvester._fetch_source(url, retries=1)
+                return url, len(found), harvester.source_errors.get(url, "")
+
+            return await asyncio.gather(*(one(url) for url in harvester.sources))
+
+    print(f"Checking lists in {default_sources_path()} ...")
+    results = run_async_entrypoint(check())
+    status_order = {"DEAD": 0, "ERROR": 1, "EMPTY": 2, "OK": 3}
+    rows = []
+    for url, count, error in results:
+        if count:
+            status = "OK"
+        elif error.startswith("http 404") or error.startswith("http 410"):
+            status = "DEAD"
+        elif error:
+            status = "ERROR"
+        else:
+            status = "EMPTY"
+        rows.append((status, count, error, url))
+    rows.sort(key=lambda row: (status_order[row[0]], -row[1], row[3]))
+    for status, count, error, url in rows:
+        print(f"{status:<6}{count:>8}  {error[:28]:<28}  {url}")
+    tally = {name: sum(1 for row in rows if row[0] == name) for name in status_order}
+    total = sum(row[1] for row in rows)
+    print(
+        f"\n{len(rows)} lists: {tally['OK']} ok ({total} entries), {tally['EMPTY']} empty, "
+        f"{tally['ERROR']} erroring, {tally['DEAD']} dead."
+    )
+    if tally["DEAD"] or tally["ERROR"]:
+        print(f"Move dead URLs to DEAD_SOURCES (or replace them) in {default_sources_path()}")
+
+
 def main() -> None:
     # Always load proxy-service-config.env if present
     load_env_file(CONFIG_FILE)
@@ -279,6 +344,10 @@ def main() -> None:
 
     if args and args[0].lower() in ("export", "--export"):
         run_export()
+        return
+
+    if args and args[0].lower() in ("sources", "--sources"):
+        run_sources_check()
         return
 
     target_script = "Proxy-api.py"

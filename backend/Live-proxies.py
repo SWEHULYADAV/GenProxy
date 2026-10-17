@@ -17,6 +17,7 @@ from proxy_core import (
     DEFAULT_TEST_URLS,
     HarvesterConfig,
     ProxyHarvester,
+    previous_session_pool,
     read_source_file,
     run_async_entrypoint,
     to_iso,
@@ -206,6 +207,8 @@ def prepare_session(args: argparse.Namespace) -> Path:
         counter += 1
     session_dir.mkdir(parents=True, exist_ok=False)
 
+    # Start warm from the previous run's pool (read before the marker moves on).
+    args.seed_file = previous_session_pool(root / "latest_session.txt", args.output)
     args.output = str(_resolve_session_file(session_dir, args.output))
     args.txt_output = str(_resolve_session_file(session_dir, args.txt_output))
     args.json_output = str(_resolve_session_file(session_dir, args.json_output))
@@ -272,6 +275,7 @@ def build_config(args: argparse.Namespace) -> HarvesterConfig:
         output_file=args.output,
         test_urls=list(args.probe_urls or DEFAULT_TEST_URLS),
         max_stored_records=args.max_candidates * 2,
+        seed_file=getattr(args, "seed_file", ""),
     )
 
 
