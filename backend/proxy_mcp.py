@@ -151,7 +151,7 @@ async def _http_json(
                     payload.setdefault(
                         "hint",
                         "Service rejected the API key. Set PROXY_MCP_API_KEY or run "
-                        "Setup-Authenticated-Proxy-Service.bat so both sides use the same key.",
+                        "'python app.py setup' so both sides use the same key.",
                     )
                 return payload
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
@@ -162,7 +162,7 @@ async def _http_json(
             "base_url": cfg["base_url"],
             "hint": (
                 "The local proxy service is not reachable. Start it with "
-                "proxy_service_start (or run Start-Live-Proxies.bat) and retry."
+                "proxy_service_start (or run 'python app.py') and retry."
             ),
         }
 
@@ -209,8 +209,8 @@ async def proxy_service_status() -> str:
         "tunnel_key_configured": bool(cfg["tunnel_key"]),
         "health": health if running else None,
         "hint": None if running else (
-            "Service is down. Call proxy_service_start, or run Start-Live-Proxies.bat, "
-            "or run Setup-Authenticated-Proxy-Service.bat first if no config exists."
+            "Service is down. Call proxy_service_start, or run 'python app.py', "
+            "or run 'python app.py setup' first if no config exists."
         ),
     })
 
@@ -250,6 +250,8 @@ async def proxy_list(
     country: Optional[str] = None,
     anonymity: Optional[str] = None,
     proxy_type: Optional[str] = None,
+    speed_tier: Optional[str] = None,
+    platform: Optional[str] = None,
     min_score: float = 0.0,
     limit: int = 50,
 ) -> str:
@@ -259,6 +261,8 @@ async def proxy_list(
     country = ISO-2 code e.g. US, anonymity = elite | anonymous | transparent,
     proxy_type = residential | mobile | datacenter | tor (residential = your own paid
     proxies from residential-proxies.txt, or free ones that look non-datacenter),
+    speed_tier = fast (<1.5s) | medium (1.5-3.5s) | slow (>3.5s),
+    platform = google | amazon | cloudflare | telegram | instagram | github | etc.,
     min_score = 0.0-1.0 quality floor.
     """
     params: Dict[str, Any] = {"limit": limit, "min_score": min_score}
@@ -270,6 +274,10 @@ async def proxy_list(
         params["anonymity"] = anonymity
     if proxy_type:
         params["proxy_type"] = proxy_type
+    if speed_tier:
+        params["speed_tier"] = speed_tier
+    if platform:
+        params["platform"] = platform
     return _dump(await _http_json("GET", "/proxies", params=params))
 
 
@@ -279,6 +287,8 @@ async def proxy_next(
     country: Optional[str] = None,
     anonymity: Optional[str] = None,
     proxy_type: Optional[str] = None,
+    speed_tier: Optional[str] = None,
+    platform: Optional[str] = None,
     min_score: float = 0.0,
     skip_cooldown: float = 0.0,
 ) -> str:
@@ -295,6 +305,10 @@ async def proxy_next(
         params["anonymity"] = anonymity
     if proxy_type:
         params["proxy_type"] = proxy_type
+    if speed_tier:
+        params["speed_tier"] = speed_tier
+    if platform:
+        params["platform"] = platform
     return _dump(await _http_json("GET", "/next", params=params))
 
 
@@ -304,9 +318,11 @@ async def proxy_random(
     country: Optional[str] = None,
     anonymity: Optional[str] = None,
     proxy_type: Optional[str] = None,
+    speed_tier: Optional[str] = None,
+    platform: Optional[str] = None,
     min_score: float = 0.0,
 ) -> str:
-    """Return one random active proxy matching the filters (protocol/country/anonymity/proxy_type/min_score)."""
+    """Return one random active proxy matching the filters (protocol/country/anonymity/proxy_type/speed_tier/platform/min_score)."""
     params: Dict[str, Any] = {"min_score": min_score}
     if protocol:
         params["protocol"] = protocol
@@ -316,6 +332,10 @@ async def proxy_random(
         params["anonymity"] = anonymity
     if proxy_type:
         params["proxy_type"] = proxy_type
+    if speed_tier:
+        params["speed_tier"] = speed_tier
+    if platform:
+        params["platform"] = platform
     return _dump(await _http_json("GET", "/random", params=params))
 
 
@@ -432,7 +452,7 @@ async def proxy_service_start(warmup: bool = False, wait_seconds: float = 60.0) 
             "ok": False,
             "error": "missing_keys",
             "hint": (
-                "Run Setup-Authenticated-Proxy-Service.bat once (creates "
+                "Run 'python app.py setup' once (creates "
                 "proxy-service-config.env), or set PROXY_MCP_API_KEY and "
                 "PROXY_MCP_TUNNEL_KEY environment variables for this MCP server."
             ),

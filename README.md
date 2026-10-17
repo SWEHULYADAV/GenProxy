@@ -200,80 +200,53 @@ venv\Scripts\playwright install chromium
 
 ### 4. Create your personal local config
 
-After you have already created `venv` and installed the Python dependencies, run:
+After installing dependencies, run the Python setup tool:
 
-```bat
-Setup-Authenticated-Proxy-Service.bat
+```bash
+python app.py setup
 ```
 
-This script:
+This:
+- Auto-generates cryptographically secure API & tunnel keys
+- Generates `proxy-service-config.env` with sensible defaults
+- Displays your private REST API and HTTP tunnel endpoints
 
-- checks that your `venv` already exists
-- checks that Python dependencies are already installed
-- asks you for your API key and tunnel password on first run
-- auto-generates them if you leave the prompts blank
-- creates `proxy-service-config.env` if it does not exist
-- saves your personal default ports and launch settings
+After setup, your normal launcher is simply:
 
-After that, your normal daily launcher becomes:
-
-```bat
-Start-Live-Proxies.bat
+```bash
+python app.py
 ```
 
-Installed core Python packages:
+## Launch Modes (100% Pure Python)
 
-- `aiohttp`
-- `aiohttp-socks`
-- `python-socks`
-- `requests`
-- `rich`
+### Option 1. Run the Proxy API Service (Default)
 
-Optional browser-helper packages:
-
-- `cloakbrowser[geoip]`
-- `camoufox[geoip]`
-- `playwright`
-
-The proxy service itself relies only on the core networking stack.
-The browser packages are optional and only needed for `stealth_browser.py`.
-
-## Launch Modes
-
-### Option 1. Run both windows with the batch file
-
-```bat
-Start-Live-Proxies.bat
+```bash
+python app.py
 ```
 
-This starts:
+Binds to local-only addresses:
+- REST API: `http://127.0.0.1:1712`
+- HTTP Proxy Tunnel: `http://127.0.0.1:1909`
 
-- live proxy monitor window
-- local API service window
+### Option 2. Run both the API Service & Live Terminal Monitor
 
-By default, the batch file now binds the service to local-only addresses:
-
-- `127.0.0.1:1712`
-- `127.0.0.1:1909`
-
-That is the safer default for personal local use.
-
-### Option 2. Run only the API service
-
-```bat
-Start-Live-Proxies.bat api
+```bash
+python app.py both
 ```
 
-### Option 3. Run only the live monitor
+Starts both the live monitor and the API background server.
 
-```bat
-Start-Live-Proxies.bat live
+### Option 3. Run only the Live Terminal Monitor
+
+```bash
+python app.py live
 ```
 
-### Option 4. Run the Python service directly
+### Option 4. Run Model Context Protocol (MCP Server for AI Agents)
 
-```bat
-venv\Scripts\python Proxy-api.py --api-key MY_API_KEY --tunnel-api-key MY_PROXY_KEY
+```bash
+python app.py mcp
 ```
 
 ### Option 5. Warmup mode
@@ -1406,8 +1379,8 @@ When using this in a real app, the practical setup order is:
 
 ### Syntax check
 
-```bat
-venv\Scripts\python -m py_compile proxy_core.py Proxy-api.py stealth_browser.py
+```bash
+python -m py_compile app.py backend/proxy_core.py backend/Proxy-api.py backend/stealth_browser.py
 ```
 
 ### Status check

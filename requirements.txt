@@ -9,6 +9,8 @@ python-socks
 requests
 rich
 curl_cffi
+httpx
+httpx[socks]
 
 # Browser & Stealth Automation (Optional - for stealth_browser.py & akamai_warm.py)
 nodriver

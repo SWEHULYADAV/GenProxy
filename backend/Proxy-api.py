@@ -1178,6 +1178,7 @@ class ProxyAPIService:
         anonymity: Optional[str] = None,
         proxy_type: Optional[str] = None,
         platform: Optional[str] = None,
+        speed_tier: Optional[str] = None,
     ):
         if not self.harvester:
             return []
@@ -1187,6 +1188,7 @@ class ProxyAPIService:
             anonymity=anonymity,
             proxy_type=proxy_type,
             platform=platform,
+            speed_tier=speed_tier,
             min_score=min_score,
             limit=limit,
         )
@@ -2770,6 +2772,7 @@ async def handle_proxies(request: web.Request) -> web.Response:
     anonymity = request.query.get("anonymity") or None
     proxy_type = request.query.get("proxy_type") or None
     platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
     proxies = [
         record.to_dict()
         for record in service.ranked_records(
@@ -2780,6 +2783,7 @@ async def handle_proxies(request: web.Request) -> web.Response:
             anonymity=anonymity,
             proxy_type=proxy_type,
             platform=platform,
+            speed_tier=speed_tier,
         )
     ]
     return web.json_response({"ok": True, "count": len(proxies), "proxies": proxies})
@@ -2795,6 +2799,7 @@ async def handle_next(request: web.Request) -> web.Response:
     anonymity = request.query.get("anonymity") or None
     proxy_type = request.query.get("proxy_type") or None
     platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
     min_score = float(request.query.get("min_score", "0"))
     skip_cooldown = float(request.query.get("skip_cooldown", "0"))
     record = service.harvester.next_proxy(
@@ -2803,6 +2808,7 @@ async def handle_next(request: web.Request) -> web.Response:
         anonymity=anonymity,
         proxy_type=proxy_type,
         platform=platform,
+        speed_tier=speed_tier,
         min_score=min_score,
         skip_cooldown=skip_cooldown,
     )
@@ -2816,6 +2822,7 @@ async def handle_next(request: web.Request) -> web.Response:
         "country": record.country,
         "anonymity": record.anonymity,
         "proxy_type": record.proxy_type,
+        "speed_tier": record.speed_tier,
         "platforms": dict(record.platforms),
         "manual": record.manual,
         "score": round(record.score, 4),
@@ -2834,6 +2841,7 @@ async def handle_random(request: web.Request) -> web.Response:
     anonymity = request.query.get("anonymity") or None
     proxy_type = request.query.get("proxy_type") or None
     platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
     min_score = float(request.query.get("min_score", "0"))
     records = service.harvester._filtered_records(
         protocol=protocol,
@@ -2841,6 +2849,7 @@ async def handle_random(request: web.Request) -> web.Response:
         anonymity=anonymity,
         proxy_type=proxy_type,
         platform=platform,
+        speed_tier=speed_tier,
         min_score=min_score,
     )
     if not records:
@@ -2854,6 +2863,7 @@ async def handle_random(request: web.Request) -> web.Response:
         "country": record.country,
         "anonymity": record.anonymity,
         "proxy_type": record.proxy_type,
+        "speed_tier": record.speed_tier,
         "platforms": dict(record.platforms),
         "manual": record.manual,
         "score": round(record.score, 4),
@@ -2874,6 +2884,7 @@ async def handle_stats(request: web.Request) -> web.Response:
     by_anonymity: Dict[str, int] = {}
     by_type: Dict[str, int] = {}
     by_platform: Dict[str, int] = {}
+    by_speed_tier: Dict[str, int] = {}
     total_score = 0.0
     total_rtt = 0.0
     count_rtt = 0
@@ -2890,6 +2901,8 @@ async def handle_stats(request: web.Request) -> web.Response:
         for platform_name, platform_ok in r.platforms.items():
             if platform_ok:
                 by_platform[platform_name] = by_platform.get(platform_name, 0) + 1
+        if r.speed_tier:
+            by_speed_tier[r.speed_tier] = by_speed_tier.get(r.speed_tier, 0) + 1
         total_score += r.score
         if r.avg_response_time > 0:
             total_rtt += r.avg_response_time
@@ -2903,6 +2916,7 @@ async def handle_stats(request: web.Request) -> web.Response:
         "by_anonymity": by_anonymity,
         "by_type": by_type,
         "by_platform": by_platform,
+        "by_speed_tier": by_speed_tier,
         "platforms_enabled": getattr(service.args, "platform_probes", "") or "",
         "residential_count": by_type.get("residential", 0),
         "tor_count": by_type.get("tor", 0),
@@ -3112,13 +3126,13 @@ def ensure_secure_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
     args.api_key = (getattr(args, "api_key", "") or "").strip()
     if not args.api_key:
         raise SystemExit(
-            "ERROR: --api-key is required. Run Setup-Authenticated-Proxy-Service.bat first."
+            "ERROR: --api-key is required. Run 'python app.py setup' first."
         )
     args.tunnel_api_key = (getattr(args, "tunnel_api_key", "") or "").strip()
     if getattr(args, "tunnel_port", 0) > 0 and not args.tunnel_api_key:
         raise SystemExit(
             "ERROR: --tunnel-api-key is required when the tunnel is enabled. "
-            "Run Setup-Authenticated-Proxy-Service.bat first."
+            "Run 'python app.py setup' first."
         )
     return args
 

@@ -119,6 +119,30 @@ DEFAULT_SOURCES = (
     # --- APIs that return JSON (regex still extracts IP:port) ---
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=http",
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=socks5",
+    # --- Curated fresh high-yield feeds (2026 update) ---
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks4_proxies.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
+    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+    "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/unchecked.txt",
+    "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
+    "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
+    "https://raw.githubusercontent.com/im-razvan/proxy_list/main/socks5.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
+    "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks4.txt",
+    "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks5.txt",
 )
 
 # ---------------------------------------------------------------------------
@@ -637,6 +661,7 @@ class ProxyRecord:
     anonymity: str = ""   # "elite" | "anonymous" | "transparent" | ""
     country: str = ""     # ISO-2 country code or ""
     proxy_type: str = ""  # "residential" | "mobile" | "datacenter" | ""
+    speed_tier: str = ""  # "fast" (<1.5s) | "medium" (1.5-3.5s) | "slow" (>3.5s)
     platforms: Dict[str, bool] = field(default_factory=dict)  # {"telegram": True, ...}
     platforms_checked_at: float = 0.0  # time.monotonic() of last platform probe
     manual: bool = False  # user-supplied entry (from residential-proxies.txt)
@@ -772,6 +797,15 @@ class ProxyRecord:
             + (stability * 0.10),
             6,
         )
+        if self.avg_response_time > 0:
+            if self.avg_response_time <= 1.5:
+                self.speed_tier = "fast"
+            elif self.avg_response_time <= 3.5:
+                self.speed_tier = "medium"
+            else:
+                self.speed_tier = "slow"
+        else:
+            self.speed_tier = ""
 
     def is_active(self, config: HarvesterConfig) -> bool:
         if self.successful_checks == 0:
@@ -805,6 +839,7 @@ class ProxyRecord:
             "anonymity": self.anonymity,
             "country": self.country,
             "proxy_type": self.proxy_type,
+            "speed_tier": self.speed_tier,
             "platforms": dict(self.platforms),
             "manual": self.manual,
             "success_rate": round(self.success_rate, 6),
@@ -842,6 +877,7 @@ class ProxyRecord:
             anonymity=str(payload.get("anonymity", "")),
             country=str(payload.get("country", "")),
             proxy_type=str(payload.get("proxy_type", "")),
+            speed_tier=str(payload.get("speed_tier", "")),
             platforms={
                 str(name): bool(ok)
                 for name, ok in (payload.get("platforms") or {}).items()
@@ -954,6 +990,23 @@ async def _probe_socks_proxy(
     )
 
 
+async def tcp_preflight_check(host: str, port: int, timeout: float = 1.8) -> bool:
+    """Pre-flight check: ensure remote TCP port responds with SYN-ACK within timeout."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def probe_proxy(
     session: aiohttp.ClientSession,
     proxy: str,
@@ -964,6 +1017,21 @@ async def probe_proxy(
     headers = {"User-Agent": user_agent, "Accept": "application/json,text/plain,*/*"}
     proxy_url = proxy if "://" in proxy else f"http://{proxy}"
     errors: List[str] = []
+    clean_addr = proxy.split("://", 1)[-1].split("@", 1)[-1]
+    if ":" in clean_addr:
+        h, p_str = clean_addr.rsplit(":", 1)
+        try:
+            p_val = int(p_str)
+            if h not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                alive = await tcp_preflight_check(h, p_val, timeout=min(1.8, timeout_seconds))
+                if not alive:
+                    return ProbeOutcome(
+                        proxy=proxy,
+                        working=False,
+                        error="TCP port unreachable / SYN-ACK timeout",
+                    )
+        except ValueError:
+            pass
 
     if proxy_url.startswith(("socks4://", "socks5://")):
         return await _probe_socks_proxy(proxy, proxy_url, test_urls, timeout_seconds, user_agent)
@@ -1001,6 +1069,22 @@ async def probe_proxy(
             errors.append(f"{exc.__class__.__name__} from {test_url}")
         except Exception as exc:
             errors.append(f"{exc.__class__.__name__} from {test_url}")
+
+    # Auto-detection fallback: if HTTP probe failed, test whether candidate is a SOCKS5 proxy
+    if _SOCKS_OK and not proxy_url.startswith(("socks4://", "socks5://")):
+        socks_candidate = f"socks5://{clean_addr}"
+        try:
+            socks_res = await _probe_socks_proxy(
+                proxy=socks_candidate,
+                proxy_url=socks_candidate,
+                test_urls=test_urls[:1],
+                timeout_seconds=min(timeout_seconds, 6.0),
+                user_agent=user_agent,
+            )
+            if socks_res.working:
+                return socks_res
+        except Exception:
+            pass
 
     return ProbeOutcome(
         proxy=proxy,
@@ -1117,6 +1201,7 @@ class ProxyHarvester:
         anonymity: Optional[str] = None,
         proxy_type: Optional[str] = None,
         platform: Optional[str] = None,
+        speed_tier: Optional[str] = None,
         min_score: float = 0.0,
         limit: Optional[int] = None,
     ) -> List[ProxyRecord]:
@@ -1136,6 +1221,9 @@ class ProxyHarvester:
         if platform:
             platform_key = platform.lower()
             records = [r for r in records if r.platforms.get(platform_key)]
+        if speed_tier:
+            st = speed_tier.strip().lower()
+            records = [r for r in records if r.speed_tier == st]
         return records if limit is None else records[:limit]
 
     def next_proxy(
@@ -1145,6 +1233,7 @@ class ProxyHarvester:
         anonymity: Optional[str] = None,
         proxy_type: Optional[str] = None,
         platform: Optional[str] = None,
+        speed_tier: Optional[str] = None,
         min_score: float = 0.0,
         skip_cooldown: float = 0.0,
     ) -> Optional[ProxyRecord]:
@@ -1155,6 +1244,7 @@ class ProxyHarvester:
             anonymity=anonymity,
             proxy_type=proxy_type,
             platform=platform,
+            speed_tier=speed_tier,
             min_score=min_score,
         )
         if skip_cooldown > 0:
