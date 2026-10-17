@@ -2234,7 +2234,45 @@ class ProxyHarvester:
         )
         return [record.proxy for record in records[: self.config.verify_batch_size]]
 
-    async def verify_proxies(self, proxies: Sequence[str]) -> List[ProbeOutcome]:
+    def _adopt_detected_protocol(
+        self, record: ProxyRecord, outcome: ProbeOutcome
+    ) -> ProxyRecord:
+        """The listed URL answered as another protocol (a SOCKS5 server listed
+        as http://, a SOCKS4 one in a SOCKS5 list). Keep the URL that works as
+        its own record and retire the listed one: real traffic sent to it with
+        the wrong protocol would only ever fail."""
+        detected = self.records.setdefault(outcome.proxy, ProxyRecord(proxy=outcome.proxy))
+        detected.add_sources(record.source_urls)
+        detected.manual = detected.manual or record.manual
+        if not detected.country:
+            detected.country = record.country
+        if not detected.proxy_type and record.manual:
+            detected.proxy_type = record.proxy_type
+        record.record_failure(
+            f"answers as {detected.protocol}, not {record.protocol}",
+            outcome.probe_url,
+            self.config.max_response_time,
+        )
+        record.consecutive_failures = max(
+            record.consecutive_failures, self.config.max_consecutive_failures
+        )
+        record.recalculate(self.config.max_response_time)
+        if not record.manual:
+            self._cooldown[record.proxy] = (
+                time.time() + self.config.max_retry_backoff_seconds,
+                99,
+            )
+        return detected
+
+    async def verify_proxies(
+        self, proxies: Sequence[str], publish_every: int = 0
+    ) -> List[ProbeOutcome]:
+        """Probe *proxies* through one sliding window of max_concurrent slots.
+
+        With publish_every > 0 the active pool is rebuilt and saved after every
+        that many results, so new proxies become usable while a large batch is
+        still running, and one slow probe never holds back a whole chunk.
+        """
         if not self.session:
             raise RuntimeError("harvester session is not ready")
 
@@ -2263,29 +2301,43 @@ class ProxyHarvester:
                     timeout_seconds=self.config.verify_timeout,
                     user_agent=self.config.user_agent,
                 )
-                record = self.records.setdefault(proxy, ProxyRecord(proxy=proxy))
-                if outcome.working:
-                    record.record_success(
-                        outcome.response_time,
-                        outcome.probe_url,
-                        outcome.origin,
-                        self.config.max_response_time,
-                    )
-                    working += 1
-                else:
-                    record.record_failure(
-                        outcome.error, outcome.probe_url, self.config.max_response_time
-                    )
-                outcomes.append(outcome)
-                verified += 1
-                self._emit_progress(
-                    phase="verifying_proxies",
-                    current_proxy=proxy,
-                    total_verify=total,
-                    verified_count=verified,
-                    working_count=working,
-                    active_now=len(self.active_proxies),
+            record = self.records.setdefault(proxy, ProxyRecord(proxy=proxy))
+            first_check = record.total_checks == 0
+            listed_in = list(record.source_urls)
+            if outcome.working and outcome.proxy != proxy:
+                record = self._adopt_detected_protocol(record, outcome)
+            if outcome.working:
+                record.record_success(
+                    outcome.response_time,
+                    outcome.probe_url,
+                    outcome.origin,
+                    self.config.max_response_time,
                 )
+                self._cooldown.pop(record.proxy, None)
+                working += 1
+            else:
+                record.record_failure(
+                    outcome.error, outcome.probe_url, self.config.max_response_time
+                )
+                self._schedule_retry(record)
+            if first_check:
+                for url in listed_in:
+                    self.source_tested[url] = self.source_tested.get(url, 0) + 1
+                    if outcome.working:
+                        self.source_working[url] = self.source_working.get(url, 0) + 1
+            outcomes.append(outcome)
+            verified += 1
+            self._emit_progress(
+                phase="verifying_proxies",
+                current_proxy=proxy,
+                total_verify=total,
+                verified_count=verified,
+                working_count=working,
+                active_now=len(self.active_proxies),
+            )
+            if publish_every and verified % publish_every == 0:
+                self._rebuild_active_proxies()
+                await self.save_pool()
 
         await asyncio.gather(*(worker(proxy) for proxy in proxies))
         self._rebuild_active_proxies()
