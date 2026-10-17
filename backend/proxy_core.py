@@ -178,6 +178,18 @@ PROXY_WITH_AUTH_PATTERN = re.compile(
 
 # Enrichment endpoints
 ANONYMITY_CHECK_URL = "http://httpbin.org/headers"
+ANONYMITY_CHECK_URLS = [
+    "http://httpbin.org/headers",
+    "https://httpbin.io/headers",
+    "https://ifconfig.me/all.json",
+]
+TRANSPARENT_LEAK_HEADERS = {
+    "x-forwarded-for", "x-real-ip", "forwarded", "client-ip",
+    "x-client-ip", "cf-connecting-ip", "true-client-ip", "x-originating-ip",
+}
+ANONYMOUS_LEAK_HEADERS = {
+    "via", "proxy-connection", "x-proxy-id", "x-forwarded-host", "x-forwarded-server",
+}
 GEO_API_URL = (
     "http://ip-api.com/json/{ip}?fields=status,countryCode,hosting,mobile,isp"
 )
@@ -190,6 +202,10 @@ _ANONYMITY_ENRICH_CONCURRENCY = 24
 _ENRICH_BATCH_SIZE = 120
 PLATFORM_PROBE_URLS = {
     "telegram": "https://api.telegram.org/",
+    "google": "https://www.google.com/generate_204",
+    "cloudflare": "https://www.cloudflare.com/cdn-cgi/trace",
+    "amazon": "https://www.amazon.com/robots.txt",
+    "github": "https://github.com/robots.txt",
     "instagram": "https://www.instagram.com/robots.txt",
     "whatsapp": "https://www.whatsapp.com/robots.txt",
 }
@@ -458,29 +474,50 @@ def _extract_ip(proxy_url: str) -> str:
         return ""
 
 
+def _evaluate_anonymity(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    headers = data.get("headers", {})
+    if not isinstance(headers, dict):
+        headers = {}
+    combined = {str(k).lower(): str(v) for k, v in headers.items()}
+    for k, v in data.items():
+        if k != "headers" and v:
+            combined[str(k).lower()] = str(v)
+    for h in TRANSPARENT_LEAK_HEADERS:
+        if h in combined and combined[h]:
+            return "transparent"
+    for h in ANONYMOUS_LEAK_HEADERS:
+        if h in combined and combined[h]:
+            return "anonymous"
+    return "elite"
+
+
 async def _check_anonymity_via_socks(proxy_url: str, timeout_seconds: float) -> str:
     if not _SOCKS_OK:
         return ""
-    try:
-        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url, ssl=False)
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        async with aiohttp.ClientSession(connector=connector, trust_env=False) as s:
-            async with s.get(
-                ANONYMITY_CHECK_URL,
-                timeout=timeout,
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-            ) as response:
-                if response.status != 200:
-                    return ""
-                data = await response.json(content_type=None)
-                received = {k.lower(): v for k, v in data.get("headers", {}).items()}
-                if "x-forwarded-for" in received or "x-real-ip" in received:
-                    return "transparent"
-                if "via" in received or "proxy-connection" in received:
-                    return "anonymous"
-                return "elite"
-    except Exception:
-        return ""
+    target_url = proxy_url
+    if target_url.startswith("socks5://"):
+        target_url = "socks5h://" + target_url[len("socks5://"):]
+    per_mirror = max(2.5, timeout_seconds / len(ANONYMITY_CHECK_URLS))
+    for check_url in ANONYMITY_CHECK_URLS:
+        try:
+            connector = aiohttp_socks.ProxyConnector.from_url(target_url, ssl=False)
+            timeout = aiohttp.ClientTimeout(total=per_mirror)
+            async with aiohttp.ClientSession(connector=connector, trust_env=False) as s:
+                async with s.get(
+                    check_url,
+                    timeout=timeout,
+                    headers={"User-Agent": DEFAULT_USER_AGENT},
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        res = _evaluate_anonymity(data)
+                        if res:
+                            return res
+        except Exception:
+            continue
+    return ""
 
 
 async def check_proxy_anonymity(
@@ -491,25 +528,24 @@ async def check_proxy_anonymity(
     """Return 'elite', 'anonymous', 'transparent', or '' on failure."""
     if proxy_url.startswith("socks"):
         return await _check_anonymity_via_socks(proxy_url, timeout_seconds)
-    try:
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        async with session.get(
-            ANONYMITY_CHECK_URL,
-            proxy=proxy_url,
-            timeout=timeout,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-        ) as response:
-            if response.status != 200:
-                return ""
-            data = await response.json(content_type=None)
-            received = {k.lower(): v for k, v in data.get("headers", {}).items()}
-            if "x-forwarded-for" in received or "x-real-ip" in received:
-                return "transparent"
-            if "via" in received or "proxy-connection" in received:
-                return "anonymous"
-            return "elite"
-    except Exception:
-        return ""
+    per_mirror = max(2.5, timeout_seconds / len(ANONYMITY_CHECK_URLS))
+    for check_url in ANONYMITY_CHECK_URLS:
+        try:
+            timeout = aiohttp.ClientTimeout(total=per_mirror)
+            async with session.get(
+                check_url,
+                proxy=proxy_url,
+                timeout=timeout,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            ) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    res = _evaluate_anonymity(data)
+                    if res:
+                        return res
+        except Exception:
+            continue
+    return ""
 
 
 def _classify_proxy_type(geo: Dict[str, Any]) -> str:

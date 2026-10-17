@@ -53,10 +53,9 @@ Main files:
   - [backend/stealth_browser.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/stealth_browser.py) - stealth browser automation helper
   - [backend/direct_fetch.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/direct_fetch.py) - direct fetch client with Chrome TLS print
   - [backend/Tor-manager.py](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/backend/Tor-manager.py) - multi-instance local Tor manager
-- [Start-Live-Proxies.bat](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/Start-Live-Proxies.bat) - one-click launcher (runs via app.py)
 - [requirements.txt](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/requirements.txt) - all consolidated Python dependencies
-- [ROADMAP.md](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/ROADMAP.md) - roadmap and gap analysis vs premium providers
-- [residential-proxies.txt](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/residential-proxies.txt) - your own (paid) residential proxies, one per line
+- [proxy-service-config.example.env](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/proxy-service-config.example.env) - environment configuration template
+- [residential-proxies.example.txt](file:///c:/Users/Admin/Desktop/Proxy_Generation-main/residential-proxies.example.txt) - template for your own pinned residential / ISP proxies
 
 ## What This Project Really Is
 
@@ -1351,13 +1350,33 @@ Most important flags for `app.py`:
 | `--tunnel-api-key` | required when tunnel is enabled | standard proxy auth password |
 | `--tunnel-auth-user` | `proxy` | standard proxy auth username |
 
-Pool tuning (optional, set in `proxy-service-config.env` — both the .bat launcher
-and MCP `proxy_service_start` pass them through):
+Pool tuning (optional, set in `proxy-service-config.env` — both `app.py` and MCP `proxy_service_start` pass them through):
 
 - `PROXY_SERVICE_MAX_CANDIDATES` (default `2000`) — candidates kept per source cycle
 - `PROXY_SERVICE_VERIFY_BATCH_SIZE` (default `250`) — active proxies re-checked per verify cycle
 - `PROXY_SERVICE_COUNTRY_SOURCES` (default `default`) — `off` or `us,de,jp,...`
 - `PROXY_SERVICE_RESIDENTIAL_FILE` / `PROXY_SERVICE_TOR_FILE` — custom file paths
+
+## Threat Intelligence & Forensic Evidence Export
+
+Export filtered proxies and forensic evidence either via the REST API or directly from the CLI for threat intelligence reporting:
+
+### 1. Direct CLI Export (No Server Needed)
+```bash
+# Export plain text proxies (IP:PORT)
+python app.py export --format txt --country US --speed-tier fast -o us_fast_proxies.txt
+
+# Export threat intelligence forensic CSV (ready for reporting to seniors / agencies)
+python app.py export --format csv -o proxy_evidence.csv
+
+# Export full forensic JSON bundle
+python app.py export --format json -o proxy_evidence.json
+```
+
+### 2. Live API Export Endpoints
+- `GET /export/proxies.txt` (or `/proxies.txt`): Raw newline-delimited `host:port` (supports `?country=`, `?protocol=`, `?speed_tier=`, `?anonymity=`, `?with_scheme=1`).
+- `GET /export/evidence.csv`: Complete CSV spreadsheet with IP, port, protocol, country, anonymity, response times, and timestamps for reporting.
+- `GET /export/evidence.json`: Audit-grade JSON evidence bundle.
 
 ## Startup Checklist
 

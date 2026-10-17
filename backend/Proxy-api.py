@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import argparse
 import base64
+import csv
+import io
 import faulthandler
 import hmac
 import ipaddress
@@ -2789,6 +2791,156 @@ async def handle_proxies(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "count": len(proxies), "proxies": proxies})
 
 
+async def handle_export_txt(request: web.Request) -> web.Response:
+    service: ProxyAPIService = request.app["service"]
+    limit = int(request.query.get("limit", "1000"))
+    min_score = float(request.query.get("min_score", "0"))
+    protocol = request.query.get("protocol") or None
+    country = request.query.get("country") or None
+    anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
+    with_scheme = request.query.get("with_scheme", request.query.get("with_protocol", "0")) in ("1", "true", "yes")
+
+    records = service.ranked_records(
+        limit=limit,
+        min_score=min_score,
+        protocol=protocol,
+        country=country,
+        anonymity=anonymity,
+        proxy_type=proxy_type,
+        platform=platform,
+        speed_tier=speed_tier,
+    )
+    lines = []
+    for r in records:
+        if with_scheme:
+            lines.append(r.proxy)
+        else:
+            # strip scheme
+            raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
+            lines.append(raw)
+    body = "\n".join(lines) + ("\n" if lines else "")
+    return web.Response(text=body, content_type="text/plain", charset="utf-8")
+
+
+async def handle_export_csv(request: web.Request) -> web.Response:
+    service: ProxyAPIService = request.app["service"]
+    limit = int(request.query.get("limit", "5000"))
+    min_score = float(request.query.get("min_score", "0"))
+    protocol = request.query.get("protocol") or None
+    country = request.query.get("country") or None
+    anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
+
+    records = service.ranked_records(
+        limit=limit,
+        min_score=min_score,
+        protocol=protocol,
+        country=country,
+        anonymity=anonymity,
+        proxy_type=proxy_type,
+        platform=platform,
+        speed_tier=speed_tier,
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "ip", "port", "protocol", "country", "anonymity", "speed_tier",
+        "avg_response_time_ms", "success_rate", "total_checks",
+        "successful_checks", "consecutive_failures", "proxy_type",
+        "score", "first_seen_utc", "last_seen_success_utc", "last_checked_utc"
+    ])
+    for r in records:
+        raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
+        parts = raw.split(":")
+        ip = parts[0] if len(parts) > 0 else ""
+        port = parts[1] if len(parts) > 1 else ""
+        writer.writerow([
+            ip,
+            port,
+            r.protocol,
+            r.country,
+            r.anonymity,
+            r.speed_tier,
+            round(r.avg_response_time * 1000, 1) if r.avg_response_time else 0.0,
+            round(r.success_rate, 3),
+            r.total_checks,
+            r.successful_checks,
+            r.consecutive_failures,
+            r.proxy_type,
+            round(r.score, 3),
+            r.first_seen.isoformat(),
+            r.last_seen_success.isoformat(),
+            r.last_checked.isoformat(),
+        ])
+    return web.Response(
+        text=buf.getvalue(),
+        content_type="text/csv",
+        charset="utf-8",
+        headers={"Content-Disposition": 'attachment; filename="proxy_evidence.csv"'},
+    )
+
+
+async def handle_export_evidence_json(request: web.Request) -> web.Response:
+    service: ProxyAPIService = request.app["service"]
+    limit = int(request.query.get("limit", "5000"))
+    min_score = float(request.query.get("min_score", "0"))
+    protocol = request.query.get("protocol") or None
+    country = request.query.get("country") or None
+    anonymity = request.query.get("anonymity") or None
+    proxy_type = request.query.get("proxy_type") or None
+    platform = request.query.get("platform") or None
+    speed_tier = request.query.get("speed_tier") or None
+
+    records = service.ranked_records(
+        limit=limit,
+        min_score=min_score,
+        protocol=protocol,
+        country=country,
+        anonymity=anonymity,
+        proxy_type=proxy_type,
+        platform=platform,
+        speed_tier=speed_tier,
+    )
+    items = []
+    for r in records:
+        raw = r.proxy.split("://", 1)[-1] if "://" in r.proxy else r.proxy
+        parts = raw.split(":")
+        ip = parts[0] if len(parts) > 0 else ""
+        port = parts[1] if len(parts) > 1 else ""
+        items.append({
+            "ip": ip,
+            "port": int(port) if port.isdigit() else port,
+            "proxy": r.proxy,
+            "protocol": r.protocol,
+            "country": r.country,
+            "anonymity": r.anonymity,
+            "speed_tier": r.speed_tier,
+            "avg_response_time_ms": round(r.avg_response_time * 1000, 1) if r.avg_response_time else 0.0,
+            "success_rate": round(r.success_rate, 3),
+            "total_checks": r.total_checks,
+            "successful_checks": r.successful_checks,
+            "consecutive_failures": r.consecutive_failures,
+            "proxy_type": r.proxy_type,
+            "score": round(r.score, 3),
+            "platforms": r.platforms,
+            "first_seen": r.first_seen.isoformat(),
+            "last_seen_success": r.last_seen_success.isoformat(),
+            "last_checked": r.last_checked.isoformat(),
+        })
+    return web.json_response({
+        "ok": True,
+        "format": "threat-intelligence-evidence",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "total_active_proxies": len(items),
+        "evidence": items,
+    })
+
+
 async def handle_next(request: web.Request) -> web.Response:
     """Round-robin: return the next proxy matching optional filter criteria."""
     service: ProxyAPIService = request.app["service"]
@@ -3110,6 +3262,10 @@ async def create_app(args: argparse.Namespace) -> web.Application:
     app.router.add_get("/health", handle_status)
     app.router.add_get("/status", handle_status)
     app.router.add_get("/proxies", handle_proxies)
+    app.router.add_get("/proxies.txt", handle_export_txt)
+    app.router.add_get("/export/proxies.txt", handle_export_txt)
+    app.router.add_get("/export/evidence.csv", handle_export_csv)
+    app.router.add_get("/export/evidence.json", handle_export_evidence_json)
     app.router.add_get("/next", handle_next)
     app.router.add_get("/random", handle_random)
     app.router.add_get("/stats", handle_stats)

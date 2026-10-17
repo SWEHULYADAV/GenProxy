@@ -131,19 +131,137 @@ def run_both() -> None:
         p_live.wait()
 
 
+def run_export() -> None:
+    """Export active proxies or threat intelligence evidence directly from session storage."""
+    import argparse
+    import csv
+    import io
+    import json
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(description="Export proxies or threat intelligence evidence.")
+    parser.add_argument("--format", choices=["txt", "csv", "json"], default="txt", help="Export format (default: txt)")
+    parser.add_argument("--output", "-o", help="Output file path (default: print to stdout)")
+    parser.add_argument("--country", "-c", help="Filter by ISO-2 country code (e.g. US, DE, IN)")
+    parser.add_argument("--protocol", "-p", help="Filter by protocol (http, socks5, socks4)")
+    parser.add_argument("--anonymity", "-a", help="Filter by anonymity (elite, anonymous, transparent)")
+    parser.add_argument("--speed-tier", "-s", help="Filter by speed tier (fast, medium, slow)")
+    parser.add_argument("--proxy-type", "-t", help="Filter by proxy type (residential, datacenter, mobile)")
+    parser.add_argument("--min-score", type=float, default=0.0, help="Minimum quality score")
+    parser.add_argument("--with-scheme", action="store_true", help="Include scheme prefix in txt export")
+    parser.add_argument("--input-file", help="Path to pool JSON file (default: latest in output/ directory)")
+
+    export_args = parser.parse_args(sys.argv[2:])
+
+    pool_file = None
+    if export_args.input_file:
+        pool_file = Path(export_args.input_file)
+    else:
+        output_root = ROOT_DIR / os.environ.get("PROXY_SERVICE_OUTPUT_ROOT", "output")
+        candidates = list(output_root.glob("**/active-proxies.json")) + list(output_root.glob("**/active_proxies.json"))
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            pool_file = candidates[0]
+
+    if not pool_file or not pool_file.exists():
+        print(f"Error: No active proxy pool JSON found. Start the service first (python app.py) or run: python app.py harvest", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(pool_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Error reading pool file {pool_file}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    raw_proxies = data if isinstance(data, list) else data.get("proxies", [])
+
+    filtered = []
+    for p in raw_proxies:
+        if export_args.country and p.get("country", "").upper() != export_args.country.upper():
+            continue
+        if export_args.protocol and p.get("protocol", "").lower() != export_args.protocol.lower():
+            continue
+        if export_args.anonymity and p.get("anonymity", "").lower() != export_args.anonymity.lower():
+            continue
+        if export_args.speed_tier and p.get("speed_tier", "").lower() != export_args.speed_tier.lower():
+            continue
+        if export_args.proxy_type and p.get("proxy_type", "").lower() != export_args.proxy_type.lower():
+            continue
+        if p.get("score", 0.0) < export_args.min_score:
+            continue
+        filtered.append(p)
+
+    out_text = ""
+    if export_args.format == "txt":
+        lines = []
+        for p in filtered:
+            proxy_str = p.get("proxy", "")
+            if export_args.with_scheme:
+                lines.append(proxy_str)
+            else:
+                raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
+                lines.append(raw)
+        out_text = "\n".join(lines) + ("\n" if lines else "")
+    elif export_args.format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "ip", "port", "protocol", "country", "anonymity", "speed_tier",
+            "avg_response_time_ms", "success_rate", "total_checks",
+            "successful_checks", "consecutive_failures", "proxy_type", "score"
+        ])
+        for p in filtered:
+            proxy_str = p.get("proxy", "")
+            raw = proxy_str.split("://", 1)[-1] if "://" in proxy_str else proxy_str
+            parts = raw.split(":")
+            ip = parts[0] if len(parts) > 0 else ""
+            port = parts[1] if len(parts) > 1 else ""
+            writer.writerow([
+                ip, port, p.get("protocol", ""), p.get("country", ""),
+                p.get("anonymity", ""), p.get("speed_tier", ""),
+                round(p.get("avg_response_time", 0.0) * 1000, 1),
+                p.get("success_rate", 0.0), p.get("total_checks", 0),
+                p.get("successful_checks", 0), p.get("consecutive_failures", 0),
+                p.get("proxy_type", ""), p.get("score", 0.0)
+            ])
+        out_text = buf.getvalue()
+    elif export_args.format == "json":
+        bundle = {
+            "ok": True,
+            "format": "threat-intelligence-evidence",
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "source_pool": str(pool_file),
+            "total_records": len(filtered),
+            "evidence": filtered,
+        }
+        out_text = json.dumps(bundle, indent=2)
+
+    if export_args.output:
+        out_path = Path(export_args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(out_text, encoding="utf-8")
+        print(f"[OK] Exported {len(filtered)} proxies to {out_path} ({export_args.format.upper()} format)")
+    else:
+        sys.stdout.write(out_text)
+
+
 def main() -> None:
     # Always load proxy-service-config.env if present
     load_env_file(CONFIG_FILE)
 
     args = sys.argv[1:]
 
-    # Handle special setup and both commands
+    # Handle special setup, both, and export commands
     if args and args[0].lower() in ("setup", "--setup"):
         run_setup()
         return
 
     if args and args[0].lower() in ("both", "--both", "start-all"):
         run_both()
+        return
+
+    if args and args[0].lower() in ("export", "--export"):
+        run_export()
         return
 
     target_script = "Proxy-api.py"

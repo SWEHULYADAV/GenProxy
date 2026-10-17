@@ -261,3 +261,13 @@ def test_the_free_residential_recipe_line_loads_as_a_pinned_residential_exit(har
     assert list(harvester.load_manual_proxies()) == [line]
     record = harvester.records[line]
     assert (record.country, record.proxy_type, record.manual, record.protocol) == ("MY", "residential", True, "socks5")
+
+
+def test_evaluate_anonymity():
+    from proxy_core import _evaluate_anonymity
+    assert _evaluate_anonymity({"headers": {"x-forwarded-for": "1.2.3.4"}}) == "transparent"
+    assert _evaluate_anonymity({"headers": {"via": "1.1 squid"}}) == "anonymous"
+    assert _evaluate_anonymity({"headers": {"user-agent": "Mozilla/5.0"}}) == "elite"
+    assert _evaluate_anonymity({"via": "1.1 tinyproxy"}) == "anonymous"
+    assert _evaluate_anonymity({"forwarded": "for=1.2.3.4"}) == "transparent"
+
