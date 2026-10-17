@@ -397,6 +397,7 @@ from proxy_core import (
     DEFAULT_TEST_URLS,
     HarvesterConfig,
     ProxyHarvester,
+    previous_session_pool,
     read_source_file,
     run_async_entrypoint,
     to_iso,
@@ -856,6 +857,7 @@ def build_config(args: argparse.Namespace) -> HarvesterConfig:
         platform_probes=args.platform_probes,
         tor_file=args.tor_file,
         country_source_codes=args.country_sources,
+        seed_file=getattr(args, "seed_file", ""),
     )
 
 
@@ -871,10 +873,13 @@ def prepare_session(args: argparse.Namespace) -> Path:
         counter += 1
     session_dir.mkdir(parents=True, exist_ok=False)
 
+    marker = root / "latest_api_session.txt"
+    # Start warm from the previous run's pool (read before the marker moves on).
+    args.seed_file = previous_session_pool(marker, args.output)
     args.output = str((session_dir / Path(args.output).name).resolve())
     args.status_file = str((session_dir / Path(args.status_file).name).resolve())
     args.session_dir = str(session_dir.resolve())
-    (root / "latest_api_session.txt").write_text(args.session_dir, encoding="utf-8")
+    marker.write_text(args.session_dir, encoding="utf-8")
     return session_dir
 
 
