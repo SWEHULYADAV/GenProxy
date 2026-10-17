@@ -559,6 +559,20 @@ def extract_proxies(text: str, default_protocol: str = "http") -> Set[str]:
     return set(extract_proxies_with_hints(text, default_protocol))
 
 
+def previous_session_pool(marker_file: str | Path, pool_name: str) -> str:
+    """Pool file of the run named in *marker_file* (output/latest_*_session.txt).
+
+    Read it before a new session overwrites the marker; the result seeds
+    HarvesterConfig.seed_file so a restart starts warm. '' when there is none.
+    """
+    try:
+        session_dir = Path(Path(marker_file).read_text(encoding="utf-8").strip())
+    except OSError:
+        return ""
+    candidate = session_dir / Path(pool_name).name
+    return str(candidate) if candidate.is_file() else ""
+
+
 def read_source_file(path: str | None) -> List[str]:
     if not path:
         return []
@@ -2370,6 +2384,7 @@ class ProxyHarvester:
 
         for proxy in remove:
             self.records.pop(proxy, None)
+            self._enrich_attempts.pop(proxy, None)
 
         if len(self.records) > self.config.max_stored_records:
             inactive = [
@@ -2386,6 +2401,7 @@ class ProxyHarvester:
             excess = len(self.records) - self.config.max_stored_records
             for proxy, _ in inactive[:excess]:
                 self.records.pop(proxy, None)
+                self._enrich_attempts.pop(proxy, None)
 
     async def run_cycle(
         self, force_collect: bool = False, force_verify: bool = False
@@ -2412,20 +2428,21 @@ class ProxyHarvester:
             candidates = await self.collect_candidates()
             summary["did_collect"] = True
             summary["collected_candidates"] = len(candidates)
+            summary["unique_candidates"] = self.last_collect_stats.get("unique_candidates", 0)
+            summary["cooling_down"] = self.last_collect_stats.get("cooling_down", 0)
             batch = self._select_collect_batch(candidates)
             if batch:
-                # Verify in chunks and publish the pool after every chunk so a
-                # fresh start becomes usable within minutes instead of waiting
-                # for the whole (up to max_candidates) initial verification.
-                chunk_size = max(1, self.config.verify_batch_size)
-                outcomes: List[ProbeOutcome] = []
-                for start in range(0, len(batch), chunk_size):
-                    chunk = batch[start : start + chunk_size]
-                    outcomes.extend(await self.verify_proxies(chunk))
-                    self._prune_records()
-                    self._rebuild_active_proxies()
-                    await self.save_pool()
+                # Publish the pool every verify_batch_size results so a fresh
+                # start becomes usable within minutes instead of waiting for
+                # the whole (up to max_candidates) initial verification.
+                outcomes = await self.verify_proxies(
+                    batch, publish_every=max(1, self.config.verify_batch_size)
+                )
+                self._prune_records()
+                self._rebuild_active_proxies()
+                await self.save_pool()
                 summary["verified_proxies"] += len(outcomes)
+                verified_now.update(batch)
                 verified_now.update(outcome.proxy for outcome in outcomes)
             self._last_collect = time.monotonic()
 
