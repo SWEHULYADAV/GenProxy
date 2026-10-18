@@ -46,6 +46,10 @@ SOURCES = [
     "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
     "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/claude89757/free_https_proxies/main/https_proxies.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/main/http.txt",
+    "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/connect.txt",
 
     # --- Fresh / high-update lists (every 5-30 min) ---
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
@@ -99,6 +103,8 @@ SOURCES = [
     "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks5.txt",
     "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
     "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/main/socks5.txt",
 
     # --- SOCKS4 lists ---
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
@@ -116,6 +122,8 @@ SOURCES = [
     "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
     "https://raw.githubusercontent.com/ProxyList-to/proxy-list/main/socks4.txt",
     "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/socks4.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/main/socks4.txt",
 ]
 
 # {cc} = lower-case ISO-2, {CC} = upper-case ISO-2. Each template is expanded once per country code in

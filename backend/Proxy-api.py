@@ -2656,8 +2656,10 @@ async def api_key_middleware(request: web.Request, handler) -> web.Response:
     api_key = request.app.get("api_key")
     if not api_key:
         return await handler(request)
-    # Health check always passes without auth
-    if request.path in ("/health",):
+    # Health check and the dashboard shell always pass without auth. The
+    # dashboard page holds no secrets; it asks the viewer for the key and
+    # sends it on its own /status and /stats calls, which stay protected.
+    if request.path in ("/health", "/dashboard"):
         return await handler(request)
     # Only accept key via X-API-Key header — NOT via query param to prevent key leakage
     # in logs, browser history, proxy logs, and screenshots.
@@ -3103,6 +3105,182 @@ async def handle_stats(request: web.Request) -> web.Response:
     })
 
 
+_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxy Pool</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --ink:#111827; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#2563eb; --ok:#16a34a; --warn:#d97706; --bad:#dc2626; --bar:#dbeafe;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0b0f17; --card:#111827; --ink:#e5e7eb; --muted:#9ca3af; --line:#1f2937;
+      --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --bar:#1e3a5f;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:16px; }
+  header { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+  h1 { font-size:18px; margin:0; font-weight:650; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
+  .dot.live { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent); }
+  .dot.down { background:var(--bad); }
+  .muted { color:var(--muted); }
+  .spacer { flex:1; }
+  input { background:var(--card); color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:7px 10px; font:inherit; min-width:0; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+    padding:7px 12px; font:inherit; cursor:pointer; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .kpi .n { font-size:28px; font-weight:700; letter-spacing:-.5px; }
+  .kpi .l { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  section { margin-top:16px; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+    margin:0 0 8px; }
+  .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
+  .row .k { width:120px; flex:none; font-size:13px; }
+  .row .track { flex:1; background:var(--bar); border-radius:6px; height:16px; overflow:hidden; }
+  .row .fill { height:100%; background:var(--accent); }
+  .row .v { width:52px; flex:none; text-align:right; font-variant-numeric:tabular-nums; font-size:13px; }
+  code { background:var(--bar); padding:2px 6px; border-radius:6px; word-break:break-all; }
+  .err { color:var(--bad); }
+  .foot { margin-top:18px; font-size:12px; color:var(--muted); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span id="dot" class="dot"></span>
+    <h1>Proxy Pool</h1>
+    <span class="spacer"></span>
+    <input id="key" type="password" placeholder="X-API-Key" autocomplete="off" size="18">
+    <button id="save">Save</button>
+  </header>
+  <p id="msg" class="muted">Enter your API key to start.</p>
+
+  <div class="grid" id="kpis"></div>
+
+  <section id="typeSec"><h2>By type</h2><div id="byType"></div></section>
+  <section id="protoSec"><h2>By protocol</h2><div id="byProto"></div></section>
+  <section id="speedSec"><h2>By speed</h2><div id="bySpeed"></div></section>
+  <section id="ctrySec"><h2>Top countries</h2><div id="byCountry"></div></section>
+
+  <section>
+    <h2>This cycle</h2>
+    <p id="progress" class="muted">—</p>
+  </section>
+
+  <div class="foot">
+    Connect any tool &rarr; proxy <code id="tun">http://127.0.0.1:1909</code>
+    or API <code>/proxy?url=...</code>, <code>/next</code>, <code>/proxies.txt</code>.
+    Auto-refresh every 3s. <span id="stamp"></span>
+  </div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var LS = "proxyDashKey";
+  try { $("key").value = localStorage.getItem(LS) || ""; } catch (e) {}
+  $("tun").textContent = "http://" + location.hostname + ":1909";
+
+  $("save").onclick = function () {
+    try { localStorage.setItem(LS, $("key").value.trim()); } catch (e) {}
+    $("msg").textContent = "Key saved. Loading…";
+    tick();
+  };
+
+  function api(path) {
+    var key = ($("key").value || "").trim();
+    return fetch(path, { headers: key ? { "X-API-Key": key } : {} })
+      .then(function (r) {
+        if (r.status === 401) throw new Error("401 — wrong or missing API key");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      });
+  }
+
+  function fmt(n) { return (n == null ? "–" : String(n)); }
+
+  function kpi(n, l) {
+    return '<div class="card kpi"><div class="n">' + fmt(n) + '</div><div class="l">' + l + '</div></div>';
+  }
+
+  function bars(el, obj, order) {
+    var keys = order || Object.keys(obj || {}).sort(function (a, b) { return (obj[b] || 0) - (obj[a] || 0); });
+    var max = 1;
+    keys.forEach(function (k) { if ((obj[k] || 0) > max) max = obj[k]; });
+    var html = "";
+    keys.forEach(function (k) {
+      var v = obj[k] || 0;
+      html += '<div class="row"><div class="k">' + k + '</div><div class="track">' +
+        '<div class="fill" style="width:' + (100 * v / max).toFixed(1) + '%"></div></div>' +
+        '<div class="v">' + v + '</div></div>';
+    });
+    el.innerHTML = html || '<span class="muted">none yet</span>';
+  }
+
+  function render(status, stats) {
+    var p = status.progress || {};
+    var socks = (stats.by_protocol && (stats.by_protocol.socks5 || 0) + (stats.by_protocol.socks4 || 0)) || 0;
+    $("kpis").innerHTML =
+      kpi(status.active_proxies, "Working now") +
+      kpi(stats.by_type && (stats.by_type.residential || 0), "Residential") +
+      kpi(stats.by_type && (stats.by_type.datacenter || 0), "Datacenter") +
+      kpi(socks, "SOCKS") +
+      kpi(stats.avg_score, "Avg score") +
+      kpi(stats.avg_response_time != null ? stats.avg_response_time + "s" : "–", "Avg speed");
+    bars($("byType"), stats.by_type);
+    bars($("byProto"), stats.by_protocol);
+    bars($("bySpeed"), stats.by_speed_tier, ["fast", "medium", "slow"]);
+    bars($("byCountry"), stats.by_country);
+    $("progress").textContent =
+      "phase " + (p.phase || "–") +
+      " · verified " + fmt(p.verified_count) + " / working " + fmt(p.working_count) +
+      (p.unique_candidates != null ? " · candidates seen " + p.unique_candidates : "") +
+      (p.cooling_down != null ? " · cooling down " + p.cooling_down : "");
+    $("stamp").textContent = "Updated " + new Date().toLocaleTimeString();
+  }
+
+  function tick() {
+    Promise.all([api("/status"), api("/stats")])
+      .then(function (r) {
+        $("dot").className = "dot live";
+        $("msg").style.display = "none";
+        render(r[0], r[1]);
+      })
+      .catch(function (e) {
+        $("dot").className = "dot down";
+        $("msg").style.display = "";
+        $("msg").className = "err";
+        $("msg").textContent = String(e.message || e);
+      });
+  }
+
+  tick();
+  setInterval(tick, 3000);
+})();
+</script>
+</body>
+</html>"""
+
+
+async def handle_dashboard(request: web.Request) -> web.Response:
+    """A self-contained live dashboard page (no secrets inside).
+
+    Served without the API key so a browser can open it; it then asks the
+    viewer for the key and uses it for the /status and /stats data calls.
+    """
+    return web.Response(text=_DASHBOARD_HTML, content_type="text/html", charset="utf-8")
+
+
 # ISO 3166-1 alpha-2 country codes (so /coverage can report which countries
 # have no active proxy yet — useful for multi-country scrapers).
 ISO_ALPHA2_COUNTRIES = (
@@ -3285,6 +3463,7 @@ async def create_app(args: argparse.Namespace) -> web.Application:
     app.router.add_get("/next", handle_next)
     app.router.add_get("/random", handle_random)
     app.router.add_get("/stats", handle_stats)
+    app.router.add_get("/dashboard", handle_dashboard)
     app.router.add_get("/coverage", handle_coverage)
     app.router.add_route("*", "/proxy", handle_proxy_raw)
     app.router.add_route("*", "/fetch", handle_fetch_json)
